@@ -71,13 +71,23 @@ LAST_PLAY_END_TS: float = 0.0
 # Optionales Timing-Trace pro Turn
 TRACE_TIMINGS = False
 TRACE_LOCK = threading.Lock()
-TRACE_ACCUM: Dict[str, Dict[str, float]] = {}
+class TimingAccumulator:
+    """Akkumulierte Timing-Werte pro Turn."""
+
+    def __init__(self):
+        self.tts_total_sec = 0.0
+        self.play_total_sec = 0.0
 
 
-def trace_begin_turn(turn_id: str) -> None:
+TRACE_ACCUM: Dict[str, TimingAccumulator] = {}
+
+
+def trace_begin_turn(turn_id: str) -> TimingAccumulator:
     """Initialisiert Timing-Akkus für einen Turn."""
+    acc = TimingAccumulator()
     with TRACE_LOCK:
-        TRACE_ACCUM[turn_id] = {"tts": 0.0, "play": 0.0}
+        TRACE_ACCUM[turn_id] = acc
+    return acc
 
 
 def trace_add(kind: str, turn_id: Optional[str], dt: float) -> None:
@@ -88,25 +98,31 @@ def trace_add(kind: str, turn_id: Optional[str], dt: float) -> None:
         d = TRACE_ACCUM.get(turn_id)
         if d is None:
             return
-        d[kind] = d.get(kind, 0.0) + max(0.0, float(dt))
+        if kind == "tts":
+            d.tts_total_sec += max(0.0, float(dt))
+        elif kind == "play":
+            d.play_total_sec += max(0.0, float(dt))
 
 
-def trace_pop_turn(turn_id: str) -> Tuple[Optional[float], Optional[float]]:
+def trace_pop_turn(turn_id: str) -> Tuple[float, float]:
     """Liest+entfernt Timing-Akkus eines Turns."""
     if not TRACE_TIMINGS:
-        return None, None
+        return 0.0, 0.0
     with TRACE_LOCK:
         d = TRACE_ACCUM.pop(turn_id, None)
     if not d:
-        return None, None
-    tts = d.get("tts", 0.0)
-    play = d.get("play", 0.0)
-    return (tts if tts > 0.0 else None, play if play > 0.0 else None)
+        return 0.0, 0.0
+    return d.tts_total_sec, d.play_total_sec
 
 
 def fmt_timing(v: Optional[float]) -> str:
     """Formatierer für Timing-Logwerte."""
     return "None" if v is None else f"{v:.2f}s"
+
+
+def fmt_seconds(v: float) -> str:
+    """Formatierer für immer numerische Sekundenwerte."""
+    return f"{max(0.0, float(v)):.2f}s"
 
 
 # Logfile & Audio-Out Verzeichnis
@@ -182,6 +198,33 @@ def env_bool(name: str, default: bool = False) -> bool:
     v = v.strip().lower()
     return v in ("1", "true", "yes", "y", "on")
 
+
+
+
+def load_local_env_file(path: Path, debug: bool = False) -> None:
+    """Lädt einfache KEY=VALUE Zeilen aus einer env-Datei in os.environ (nur wenn KEY noch nicht gesetzt)."""
+    if not path.exists():
+        return
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            key = k.strip()
+            if not key:
+                continue
+            val = v.strip()
+            if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+                val = val[1:-1]
+            os.environ.setdefault(key, val)
+    except Exception as e:
+        if debug:
+            log(f"Env load warning: {path} ({e})", debug)
 
 def now_iso() -> str:
     """Zeitstempel (lokal) im ISO-ish Format für Logs."""
@@ -1153,9 +1196,14 @@ def main():
     """
     global LAST_PLAY_END_TS, TRACE_TIMINGS
 
+    # Optionales env-file laden (für direkten Python-Start ohne run.sh)
+    load_local_env_file(Path(__file__).with_name("config.env"), debug=False)
+
     debug = env_bool("MIA_DEBUG", False)
+    trace_env_raw = os.environ.get("MIA_TRACE_TIMINGS", "")
     TRACE_TIMINGS = env_bool("MIA_TRACE_TIMINGS", False)
 
+    log(f"TraceTimings: enabled={TRACE_TIMINGS} env={trace_env_raw if trace_env_raw != '' else '<unset>'}", debug)
     log(f"Using python: {sys.executable}", debug)
     log(f"Python version: {sys.version.split()[0]}", debug)
 
@@ -1328,6 +1376,8 @@ def main():
         t_whisper: Optional[float] = None
         t_ollama_total: Optional[float] = None
         t_first_token: Optional[float] = None
+        t_tts_total = 0.0
+        t_play_total = 0.0
 
         if TRACE_TIMINGS:
             trace_begin_turn(turn_id)
@@ -1338,6 +1388,8 @@ def main():
             try:
                 t = whisper_transcribe(in_wav, whisper_model, whisper_cli, whisper_lang, debug).strip()
                 t_whisper = time.perf_counter() - t0_whisper
+                if TRACE_TIMINGS:
+                    log(f"Trace: after_whisper turn={turn_id}", debug)
             except Exception as e:
                 t_whisper = time.perf_counter() - t0_whisper
                 log(f"Whisper ERROR: {e}", debug)
@@ -1488,7 +1540,7 @@ def main():
                 log(
                     f"TIMING turn={turn_id} record={fmt_timing(t_record)} whisper={fmt_timing(t_whisper)} "
                     f"ollama_total={fmt_timing(t_ollama_total)} first_token={fmt_timing(t_first_token)} "
-                    f"tts_total={fmt_timing(t_tts_total)} play_total={fmt_timing(t_play_total)} mode={mode}",
+                    f"tts_total={fmt_seconds(t_tts_total)} play_total={fmt_seconds(t_play_total)} mode={mode}",
                     debug,
                 )
 

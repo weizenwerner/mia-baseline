@@ -68,6 +68,15 @@ CURRENT_PLAY_PID: Optional[int] = None
 # Wird für Echo-Guard verwendet: kurz nach Playback-Ende sind Echo-Fehltriggers wahrscheinlicher.
 LAST_PLAY_END_TS: float = 0.0
 
+STOP_COMMANDS = {
+    "stop",
+    "stopp",
+    "pause",
+    "mia stop",
+    "mia stopp",
+    "mia pause",
+}
+
 # Optionales Timing-Trace pro Turn
 TRACE_TIMINGS = False
 TRACE_LOCK = threading.Lock()
@@ -509,38 +518,19 @@ def tokenize(text: str) -> List[str]:
     return toks
 
 
-def is_stop_command(text: str, stop_csv: str) -> bool:
+def is_stop_command(text: str) -> bool:
     """
     Robuste Stop/Barge-in Erkennung.
 
-    Erkennt:
-    - direkte Wörter: stop/stopp/halt/pause/warte/abbruch/cancel...
-    - Phrasen aus stop_csv (substring match)
-    - "mia stop", oder Whisper-Fehler wie "mi stopp", "mja stopp"
+    Erkennt nur definierte Stop-Kommandos aus STOP_COMMANDS.
     """
     nt = norm_text(text)
     toks = tokenize(nt)
 
-    # 1) explizite Phrasenliste aus Env
-    if contains_any(nt, stop_csv):
-        return True
-
-    # 2) einzelne Stop-Wörter
-    stop_words = {
-        "stop", "stopp", "halt", "pause", "warte",
-        "abbruch", "abbrechen", "cancel", "canceln"
-    }
-    if any(tok in stop_words for tok in toks):
-        return True
-
-    # 3) Prefix + Core (z.B. mia + stopp)
-    prefixes = {"mia", "mi", "mja", "mya", "mir"}
-    core = {"stop", "stopp", "halt", "pause", "warte", "abbruch", "abbrechen", "cancel", "canceln"}
+    candidates = set(toks)
     for i in range(len(toks) - 1):
-        if toks[i] in prefixes and toks[i + 1] in core:
-            return True
-
-    return False
+        candidates.add(f"{toks[i]} {toks[i + 1]}")
+    return any(cmd in candidates for cmd in STOP_COMMANDS)
 
 
 # ----------------- VAD recorder -----------------
@@ -1268,7 +1258,6 @@ class BargeInMonitor:
         barge_model: str,
         window_sec: float,
         interval_sec: float,
-        stop_csv: str,
         on_hit: Callable[[str], None],
         debug: bool,
     ):
@@ -1278,7 +1267,6 @@ class BargeInMonitor:
         self.barge_model = barge_model
         self.window_sec = max(0.6, float(window_sec))
         self.interval_sec = max(0.15, float(interval_sec))
-        self.stop_csv = stop_csv
         self.on_hit = on_hit
         self.debug = debug
 
@@ -1369,7 +1357,7 @@ class BargeInMonitor:
                     debug=False,
                 ).strip()
                 nt = norm_text(txt)
-                if txt and is_stop_command(txt, self.stop_csv):
+                if txt and is_stop_command(txt):
                     now = time.time()
                     if (now - self._last_hit_ts) > 0.8:
                         self._last_hit_ts = now
@@ -1445,10 +1433,6 @@ def main():
     barge_whisper_model = env_str("MIA_BARGE_WHISPER_MODEL", "/data/mia/hear/whisper.cpp/models/ggml-tiny.bin")
     barge_window_sec = env_float("MIA_BARGE_WINDOW_SEC", 1.10)
     barge_interval_sec = env_float("MIA_BARGE_INTERVAL_SEC", 0.35)
-    barge_stopwords = env_str(
-        "MIA_BARGE_STOPWORDS",
-        "stop,stopp,warte,halt,pause,mia stop,mia stopp,mia warte,mia halt,mia pause,mi stop,mi stopp",
-    )
 
     # Audio/VAD Parameter (normaler Listening-Mode)
     rate = env_int("MIA_RATE", 16000)
@@ -1475,10 +1459,7 @@ def main():
     awake_timeout_sec = env_int("MIA_AWAKE_TIMEOUT_SEC", 180)
 
     # Stop/Barge-in
-    stopwords = env_str(
-        "MIA_STOPWORDS",
-        "stop,stopp,halt,pause,warte,mia stop,mia stopp,mia halt,mia pause,mia warte,mi stopp,mi stop",
-    )
+    stopwords = ",".join(sorted(STOP_COMMANDS))
 
     # TTS streaming: LLM deltas werden in Chunks gesprochen
     tts_stream = env_bool("MIA_TTS_STREAM", True)
@@ -1558,7 +1539,6 @@ def main():
         barge_model=barge_whisper_model,
         window_sec=barge_window_sec,
         interval_sec=barge_interval_sec,
-        stop_csv=barge_stopwords,
         on_hit=_on_barge_hit,
         debug=debug,
     )
@@ -1651,7 +1631,7 @@ def main():
             # STOP/EXIT funktionieren IMMER:
             # - sogar ohne Wake
             # - sogar während speaking
-            if is_stop_command(t, stopwords):
+            if is_stop_command(t):
                 if debug:
                     log(f"Barge-in: stop erkannt -> '{t}'", debug)
                     log("Barge-in: cancel requested (stop)", debug)

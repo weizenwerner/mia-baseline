@@ -68,6 +68,46 @@ CURRENT_PLAY_PID: Optional[int] = None
 # Wird für Echo-Guard verwendet: kurz nach Playback-Ende sind Echo-Fehltriggers wahrscheinlicher.
 LAST_PLAY_END_TS: float = 0.0
 
+# Optionales Timing-Trace pro Turn
+TRACE_TIMINGS = False
+TRACE_LOCK = threading.Lock()
+TRACE_ACCUM: Dict[str, Dict[str, float]] = {}
+
+
+def trace_begin_turn(turn_id: str) -> None:
+    """Initialisiert Timing-Akkus für einen Turn."""
+    with TRACE_LOCK:
+        TRACE_ACCUM[turn_id] = {"tts": 0.0, "play": 0.0}
+
+
+def trace_add(kind: str, turn_id: Optional[str], dt: float) -> None:
+    """Addiert dt (Sekunden) auf einen Turn-Akku."""
+    if not TRACE_TIMINGS or not turn_id:
+        return
+    with TRACE_LOCK:
+        d = TRACE_ACCUM.get(turn_id)
+        if d is None:
+            return
+        d[kind] = d.get(kind, 0.0) + max(0.0, float(dt))
+
+
+def trace_pop_turn(turn_id: str) -> Tuple[Optional[float], Optional[float]]:
+    """Liest+entfernt Timing-Akkus eines Turns."""
+    if not TRACE_TIMINGS:
+        return None, None
+    with TRACE_LOCK:
+        d = TRACE_ACCUM.pop(turn_id, None)
+    if not d:
+        return None, None
+    tts = d.get("tts", 0.0)
+    play = d.get("play", 0.0)
+    return (tts if tts > 0.0 else None, play if play > 0.0 else None)
+
+
+def fmt_timing(v: Optional[float]) -> str:
+    """Formatierer für Timing-Logwerte."""
+    return "None" if v is None else f"{v:.2f}s"
+
 
 # Logfile & Audio-Out Verzeichnis
 LOG_FILE = Path("/data/mia/logs/talk/talk.log")
@@ -795,7 +835,7 @@ def clean_for_tts(text: str) -> str:
     return t
 
 
-def piper_speak(text: str, debug: bool) -> Path:
+def piper_speak(text: str, debug: bool, turn_id: Optional[str] = None) -> Path:
     """
     Piper TTS:
     - erzeugt WAV in AUDIO_OUT_DIR
@@ -817,9 +857,10 @@ def piper_speak(text: str, debug: bool) -> Path:
     # Ab hier gilt: sie spricht / ist busy
     SPEAKING.set()
 
-    t0 = time.time()
+    t0 = time.perf_counter()
     r = subprocess.run(cmd, input=text, text=True, capture_output=True)
-    dt = time.time() - t0
+    dt = time.perf_counter() - t0
+    trace_add("tts", turn_id, dt)
 
     if r.returncode != 0 or not out_wav.exists():
         SPEAKING.clear()
@@ -834,7 +875,7 @@ def piper_speak(text: str, debug: bool) -> Path:
     return out_wav
 
 
-def play_wav(wav: Path, debug: bool) -> None:
+def play_wav(wav: Path, debug: bool, turn_id: Optional[str] = None) -> None:
     """
     Playback via pw-play:
     - setzt SPEAKING für Dauer des Playback
@@ -855,6 +896,7 @@ def play_wav(wav: Path, debug: bool) -> None:
 
     p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     CURRENT_PLAY_PID = p.pid
+    t0 = time.perf_counter()
     try:
         while p.poll() is None:
             if STOP or CANCEL_TTS.is_set():
@@ -866,6 +908,7 @@ def play_wav(wav: Path, debug: bool) -> None:
                 return
             time.sleep(0.02)
     finally:
+        trace_add("play", turn_id, time.perf_counter() - t0)
         try:
             if p.poll() is None:
                 p.kill()
@@ -890,7 +933,7 @@ class TTSManager:
 
     def __init__(self, debug: bool):
         self.debug = debug
-        self.q: "queue.Queue[Union[str, None]]" = queue.Queue(maxsize=64)
+        self.q: "queue.Queue[Union[Tuple[str, Optional[str]], None]]" = queue.Queue(maxsize=64)
         self.th: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
@@ -902,12 +945,12 @@ class TTSManager:
             self.th = threading.Thread(target=self._worker, daemon=True)
             self.th.start()
 
-    def enqueue(self, text: str) -> None:
+    def enqueue(self, text: str, turn_id: Optional[str] = None) -> None:
         """Legt Text in Queue (wenn nicht STOP/CANCEL)."""
         if STOP or CANCEL_TTS.is_set():
             return
         try:
-            self.q.put(text, timeout=1.0)
+            self.q.put((text, turn_id), timeout=1.0)
         except Exception:
             # wenn Queue voll oder thread hängt: dann drop
             pass
@@ -954,16 +997,17 @@ class TTSManager:
                     self._drain_queue_fast()
                     break
 
-                txt = clean_for_tts(item)
+                txt_raw, item_turn_id = item
+                txt = clean_for_tts(txt_raw)
                 if not txt:
                     continue
 
                 try:
-                    wav = piper_speak(txt, self.debug)
+                    wav = piper_speak(txt, self.debug, turn_id=item_turn_id)
                     if STOP or CANCEL_TTS.is_set():
                         SPEAKING.clear()
                         continue
-                    play_wav(wav, self.debug)
+                    play_wav(wav, self.debug, turn_id=item_turn_id)
                 except Exception as e:
                     SPEAKING.clear()
                     log(f"TTS/Playback ERROR: {e}", self.debug)
@@ -1107,9 +1151,10 @@ def main():
         - TTS chunks enqueuen
         - Session speichern
     """
-    global LAST_PLAY_END_TS
+    global LAST_PLAY_END_TS, TRACE_TIMINGS
 
     debug = env_bool("MIA_DEBUG", False)
+    TRACE_TIMINGS = env_bool("MIA_TRACE_TIMINGS", False)
 
     log(f"Using python: {sys.executable}", debug)
     log(f"Python version: {sys.version.split()[0]}", debug)
@@ -1257,6 +1302,7 @@ def main():
         _rms = speak_rms_threshold if speaking_now else rms_threshold
 
         # Audio aufnehmen bis VAD "speech segment" erkannt hat
+        t0_record = time.perf_counter()
         ok = record_vad_to_wav(
             output_wav=in_wav,
             rate=rate,
@@ -1270,151 +1316,181 @@ def main():
             rms_threshold=_rms,
             debug=debug,
         )
+        t_record = time.perf_counter() - t0_record
         if STOP:
             break
         if not ok:
             # nichts erkannt -> weiter
             continue
 
-        # Whisper transkribieren
+        turn_id = str(uuid.uuid4())
+        mode = "stream" if tts_stream else "nonstream"
+        t_whisper: Optional[float] = None
+        t_ollama_total: Optional[float] = None
+        t_first_token: Optional[float] = None
+
+        if TRACE_TIMINGS:
+            trace_begin_turn(turn_id)
+
         try:
-            t = whisper_transcribe(in_wav, whisper_model, whisper_cli, whisper_lang, debug).strip()
-        except Exception as e:
-            log(f"Whisper ERROR: {e}", debug)
-            continue
-        finally:
-            # input wav wegräumen
+            # Whisper transkribieren
+            t0_whisper = time.perf_counter()
             try:
-                in_wav.unlink(missing_ok=True)
-            except Exception:
-                pass
+                t = whisper_transcribe(in_wav, whisper_model, whisper_cli, whisper_lang, debug).strip()
+                t_whisper = time.perf_counter() - t0_whisper
+            except Exception as e:
+                t_whisper = time.perf_counter() - t0_whisper
+                log(f"Whisper ERROR: {e}", debug)
+                continue
+            finally:
+                # input wav wegräumen
+                try:
+                    in_wav.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-        # Noise/Leere Transkripte ignorieren
-        if is_noise_transcript(t):
-            continue
+            # Noise/Leere Transkripte ignorieren
+            if is_noise_transcript(t):
+                continue
 
-        # STOP/EXIT funktionieren IMMER:
-        # - sogar ohne Wake
-        # - sogar während speaking
-        if is_stop_command(t, stopwords):
-            if debug:
-                log(f"Barge-in: stop erkannt -> '{t}'", debug)
-                log("Barge-in: cancel requested (stop)", debug)
-            tts_mgr.stop(reason="stop")
-            log("Assistant output cancelled -> continue listening.", debug)
-            continue
+            # STOP/EXIT funktionieren IMMER:
+            # - sogar ohne Wake
+            # - sogar während speaking
+            if is_stop_command(t, stopwords):
+                if debug:
+                    log(f"Barge-in: stop erkannt -> '{t}'", debug)
+                    log("Barge-in: cancel requested (stop)", debug)
+                tts_mgr.stop(reason="stop")
+                log("Assistant output cancelled -> continue listening.", debug)
+                continue
 
-        # Exit
-        if contains_any(t, exitwords):
-            log(f"Exit erkannt: '{t}' -> shutdown.", debug)
-            break
+            # Exit
+            if contains_any(t, exitwords):
+                log(f"Exit erkannt: '{t}' -> shutdown.", debug)
+                break
 
-        # Während speaking werden alle Nicht-Stop Inputs ignoriert
-        if speaking_now:
-            if debug:
-                log(f"Speaking -> ignored (non-stop): '{t}'", debug)
-            continue
+            # Während speaking werden alle Nicht-Stop Inputs ignoriert
+            if speaking_now:
+                if debug:
+                    log(f"Speaking -> ignored (non-stop): '{t}'", debug)
+                continue
 
-        # Wakeword prüfen
-        woke_now = contains_any(t, wakewords)
-        if woke_now:
-            awake = True
-            awake_until = time.time() + float(awake_timeout_sec)
-            if debug:
-                log(f"Wake erkannt -> Mia ist wach für {awake_timeout_sec}s.", debug)
+            # Wakeword prüfen
+            woke_now = contains_any(t, wakewords)
+            if woke_now:
+                awake = True
+                awake_until = time.time() + float(awake_timeout_sec)
+                if debug:
+                    log(f"Wake erkannt -> Mia ist wach für {awake_timeout_sec}s.", debug)
 
-        # require_wake: wenn nicht awake -> ignorieren
-        if require_wake and not awake:
-            if debug:
-                log(f"Wake required -> ignored: '{t}'", debug)
-            continue
+            # require_wake: wenn nicht awake -> ignorieren
+            if require_wake and not awake:
+                if debug:
+                    log(f"Wake required -> ignored: '{t}'", debug)
+                continue
 
-        # Wenn awake: Timeout verlängern
-        if awake:
-            awake_until = time.time() + float(awake_timeout_sec)
+            # Wenn awake: Timeout verlängern
+            if awake:
+                awake_until = time.time() + float(awake_timeout_sec)
 
-        # Wakeprefix entfernen, damit prompt sauber ist
-        user_text = strip_wake_prefix(t, wakewords) if woke_now else t
-        user_text = user_text.strip()
-        if not user_text:
-            continue
+            # Wakeprefix entfernen, damit prompt sauber ist
+            user_text = strip_wake_prefix(t, wakewords) if woke_now else t
+            user_text = user_text.strip()
+            if not user_text:
+                continue
 
-        # Echo-Guard nur kurz nach Playback-Ende:
-        # Wenn user_text stark mit recent_assistant überlappt, ist es vermutlich Mia's Echo.
-        echo_recent = (time.time() - LAST_PLAY_END_TS) < echo_window_sec
-        if echo_recent and (not is_question_like(user_text)) and looks_like_echo(user_text, recent_assistant, min_overlap=echo_overlap):
-            if debug:
-                log(f"Echo-guard -> ignored: '{user_text}'", debug)
-            continue
+            # Echo-Guard nur kurz nach Playback-Ende:
+            # Wenn user_text stark mit recent_assistant überlappt, ist es vermutlich Mia's Echo.
+            echo_recent = (time.time() - LAST_PLAY_END_TS) < echo_window_sec
+            if echo_recent and (not is_question_like(user_text)) and looks_like_echo(user_text, recent_assistant, min_overlap=echo_overlap):
+                if debug:
+                    log(f"Echo-guard -> ignored: '{user_text}'", debug)
+                continue
 
-        log(f"Du: {user_text}", debug)
-        sess["messages"].append({"role": "user", "content": user_text})
+            log(f"Du: {user_text}", debug)
+            sess["messages"].append({"role": "user", "content": user_text})
 
-        # neue Ausgabe -> cancel flag reset
-        CANCEL_TTS.clear()
-
-        if tts_stream:
-            # TTS Worker sicherstellen
-            tts_mgr.start()
-            log(">>> Mia spricht…", debug)
-
-        assistant = ""
-        try:
-            if requests is None:
-                raise RuntimeError("requests missing -> install requests in venv")
+            # neue Ausgabe -> cancel flag reset
+            CANCEL_TTS.clear()
 
             if tts_stream:
-                # Wenn ein Chunk fertig ist -> in TTS Queue
-                def emit_chunk(txt: str):
-                    if STOP or CANCEL_TTS.is_set():
-                        return
-                    tts_mgr.enqueue(txt)
-                    recent_assistant.append(txt)
+                # TTS Worker sicherstellen
+                tts_mgr.start()
+                log(">>> Mia spricht…", debug)
 
-                chunker = StreamChunker(emit=emit_chunk, min_chars=tts_min_chars, max_chars=tts_max_chars)
-
-                # Bei jedem LLM delta -> chunker.push
-                def on_delta(delta: str):
-                    if STOP or CANCEL_TTS.is_set():
-                        return
-                    chunker.push(delta)
-
-                assistant = ollama_chat_http_stream(
-                    ollama_host, model, keepalive, sess["messages"], debug, on_delta=on_delta
-                )
-                # Rest raus
-                chunker.flush()
-            else:
-                # ohne streaming: erst komplette Antwort holen, dann ggf. sprechen (hier: nur log)
-                assistant = ollama_chat_http_stream(
-                    ollama_host, model, keepalive, sess["messages"], debug, on_delta=None
-                )
-
-        except Exception as e:
-            log(f"Ollama ERROR: {e}", debug)
             assistant = ""
+            try:
+                if requests is None:
+                    raise RuntimeError("requests missing -> install requests in venv")
 
-        # Wenn user stopp gesagt hat während Streaming -> abbrechen
-        if CANCEL_TTS.is_set():
-            tts_mgr.stop(reason="cancel")
-            log("Assistant output cancelled -> continue listening.", debug)
-            continue
+                t0_ollama = time.perf_counter()
+                if tts_stream:
+                    # Wenn ein Chunk fertig ist -> in TTS Queue
+                    def emit_chunk(txt: str):
+                        if STOP or CANCEL_TTS.is_set():
+                            return
+                        tts_mgr.enqueue(txt, turn_id=turn_id)
+                        recent_assistant.append(txt)
 
-        # Falls LLM leer -> fallback
-        assistant = (assistant or "").strip() or "Ich habe gerade keine Antwort. Bitte wiederhole das."
-        log(f"Mia: {assistant}", debug)
+                    chunker = StreamChunker(emit=emit_chunk, min_chars=tts_min_chars, max_chars=tts_max_chars)
 
-        # Volltext auch in echo history (zusätzlich zu chunk history)
-        recent_assistant.append(assistant)
+                    # Bei jedem LLM delta -> chunker.push
+                    def on_delta(delta: str):
+                        nonlocal t_first_token
+                        if STOP or CANCEL_TTS.is_set():
+                            return
+                        if t_first_token is None:
+                            t_first_token = time.perf_counter() - t0_ollama
+                        chunker.push(delta)
 
-        # Session speichern
-        sess["messages"].append({"role": "assistant", "content": assistant})
-        save_session(sess_path, sess)
+                    assistant = ollama_chat_http_stream(
+                        ollama_host, model, keepalive, sess["messages"], debug, on_delta=on_delta
+                    )
+                    # Rest raus
+                    chunker.flush()
+                else:
+                    # ohne streaming: erst komplette Antwort holen, dann ggf. sprechen (hier: nur log)
+                    assistant = ollama_chat_http_stream(
+                        ollama_host, model, keepalive, sess["messages"], debug, on_delta=None
+                    )
+                t_ollama_total = time.perf_counter() - t0_ollama
 
-        # WICHTIG:
-        # Kein tts_mgr.finish()!
-        # - Worker darf laufen (Queue wartet)
-        # - SPEAKING wird NUR während Synth/Playback gesetzt/gelöscht
+            except Exception as e:
+                if "t0_ollama" in locals():
+                    t_ollama_total = time.perf_counter() - t0_ollama
+                log(f"Ollama ERROR: {e}", debug)
+                assistant = ""
+
+            # Wenn user stopp gesagt hat während Streaming -> abbrechen
+            if CANCEL_TTS.is_set():
+                tts_mgr.stop(reason="cancel")
+                log("Assistant output cancelled -> continue listening.", debug)
+                continue
+
+            # Falls LLM leer -> fallback
+            assistant = (assistant or "").strip() or "Ich habe gerade keine Antwort. Bitte wiederhole das."
+            log(f"Mia: {assistant}", debug)
+
+            # Volltext auch in echo history (zusätzlich zu chunk history)
+            recent_assistant.append(assistant)
+
+            # Session speichern
+            sess["messages"].append({"role": "assistant", "content": assistant})
+            save_session(sess_path, sess)
+
+            # WICHTIG:
+            # Kein tts_mgr.finish()!
+            # - Worker darf laufen (Queue wartet)
+            # - SPEAKING wird NUR während Synth/Playback gesetzt/gelöscht
+        finally:
+            if TRACE_TIMINGS:
+                t_tts_total, t_play_total = trace_pop_turn(turn_id)
+                log(
+                    f"TIMING turn={turn_id} record={fmt_timing(t_record)} whisper={fmt_timing(t_whisper)} "
+                    f"ollama_total={fmt_timing(t_ollama_total)} first_token={fmt_timing(t_first_token)} "
+                    f"tts_total={fmt_timing(t_tts_total)} play_total={fmt_timing(t_play_total)} mode={mode}",
+                    debug,
+                )
 
     # Shutdown: laufende Audioausgabe stoppen
     if tts_stream:

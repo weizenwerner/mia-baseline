@@ -70,6 +70,7 @@ CURRENT_PLAY_PID: Optional[int] = None
 LAST_PLAY_END_TS: float = 0.0
 
 STOP_COMMANDS: set = set()
+DEBUG_ENABLED = False
 
 # Serialisiert Mikrofonzugriffe (Main-VAD vs. Barge-in), um pw-record Konkurrenz zu vermeiden.
 MIC_RECORD_LOCK = threading.Lock()
@@ -318,10 +319,11 @@ def now_iso() -> str:
 def log(msg: str, debug: bool = False, also_stdout: bool = True) -> None:
     """
     Logging:
-    - standardmäßig auch auf stdout (flush)
-    - append ins LOG_FILE
+    - debug=True wird auf stdout nur bei aktivem DEBUG_ENABLED ausgegeben
+    - Datei-Logging bleibt vollständig (auch Debug), um Diagnose nicht zu verlieren
     """
-    if also_stdout:
+    should_stdout = bool(also_stdout and ((not debug) or DEBUG_ENABLED))
+    if should_stdout:
         print(msg, flush=True)
     try:
         ensure_dir(LOG_FILE.parent)
@@ -1141,6 +1143,7 @@ class TTSManager:
                     trace_mark_chunk_done(item_turn_id)
                     continue
 
+                wav: Optional[Path] = None
                 try:
                     wav = piper_speak(txt, self.debug, turn_id=item_turn_id)
                     if STOP or CANCEL_TTS.is_set():
@@ -1151,6 +1154,11 @@ class TTSManager:
                     SPEAKING.clear()
                     log(f"TTS/Playback ERROR: {e}", self.debug)
                 finally:
+                    if wav is not None:
+                        try:
+                            wav.unlink(missing_ok=True)
+                        except Exception:
+                            pass
                     trace_mark_chunk_done(item_turn_id)
         finally:
             SPEAKING.clear()
@@ -1434,12 +1442,13 @@ def main():
         - TTS chunks enqueuen
         - Session speichern
     """
-    global LAST_PLAY_END_TS, TRACE_TIMINGS, STOP_COMMANDS
+    global LAST_PLAY_END_TS, TRACE_TIMINGS, STOP_COMMANDS, DEBUG_ENABLED
 
     # Optionales env-file laden (für direkten Python-Start ohne run.sh)
     load_local_env_file(Path(__file__).with_name("config.env"), debug=False)
 
     debug = env_bool("MIA_DEBUG", False)
+    DEBUG_ENABLED = debug
     trace_env_raw = os.environ.get("MIA_TRACE_TIMINGS", "")
     TRACE_TIMINGS = env_bool("MIA_TRACE_TIMINGS", False)
 

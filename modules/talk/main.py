@@ -70,14 +70,7 @@ CURRENT_PLAY_PID: Optional[int] = None
 # Wird für Echo-Guard verwendet: kurz nach Playback-Ende sind Echo-Fehltriggers wahrscheinlicher.
 LAST_PLAY_END_TS: float = 0.0
 
-STOP_COMMANDS = {
-    "stop",
-    "stopp",
-    "pause",
-    "mia stop",
-    "mia stopp",
-    "mia pause",
-}
+STOP_COMMANDS: set = set()
 
 # Optionales Timing-Trace pro Turn
 TRACE_TIMINGS = False
@@ -528,11 +521,11 @@ def tokenize(text: str) -> List[str]:
     return toks
 
 
-def is_stop_command(text: str) -> bool:
+def is_stop_command(text: str, stop_set: set) -> bool:
     """
     Robuste Stop/Barge-in Erkennung.
 
-    Erkennt nur definierte Stop-Kommandos aus STOP_COMMANDS.
+    Erkennt nur definierte Stop-Kommandos aus übergebenem stop_set.
     """
     nt = norm_text(text)
     toks = tokenize(nt)
@@ -540,7 +533,7 @@ def is_stop_command(text: str) -> bool:
     candidates = set(toks)
     for i in range(len(toks) - 1):
         candidates.add(f"{toks[i]} {toks[i + 1]}")
-    return any(cmd in candidates for cmd in STOP_COMMANDS)
+    return any(cmd in candidates for cmd in stop_set)
 
 
 # ----------------- VAD recorder -----------------
@@ -1310,6 +1303,7 @@ class BargeInMonitor:
         barge_model: str,
         window_sec: float,
         interval_sec: float,
+        is_stop_match: Callable[[str], bool],
         on_hit: Callable[[str], None],
         debug: bool,
     ):
@@ -1319,6 +1313,7 @@ class BargeInMonitor:
         self.barge_model = barge_model
         self.window_sec = max(0.6, float(window_sec))
         self.interval_sec = max(0.15, float(interval_sec))
+        self.is_stop_match = is_stop_match
         self.on_hit = on_hit
         self.debug = debug
 
@@ -1409,7 +1404,7 @@ class BargeInMonitor:
                     debug=False,
                 ).strip()
                 nt = norm_text(txt)
-                if txt and is_stop_command(txt):
+                if txt and self.is_stop_match(txt):
                     now = time.time()
                     if (now - self._last_hit_ts) > 0.8:
                         self._last_hit_ts = now
@@ -1514,7 +1509,7 @@ def main():
     stopwords_raw = env_str("MIA_STOPWORDS", "stop,stopp,pause,mia stop,mia stopp,mia pause")
     stopwords_list = [normalize_cmd(x) for x in stopwords_raw.split(",") if normalize_cmd(x)]
     STOP_COMMANDS = set(stopwords_list) if stopwords_list else {
-        "stop", "stopp", "pause", "mia stop", "mia stopp", "mia pause"
+        normalize_cmd(x) for x in "stop,stopp,pause,mia stop,mia stopp,mia pause".split(",")
     }
     stopwords = stopwords_raw
 
@@ -1630,6 +1625,7 @@ def main():
         barge_model=barge_whisper_model,
         window_sec=barge_window_sec,
         interval_sec=barge_interval_sec,
+        is_stop_match=lambda txt: is_stop_command(txt, STOP_COMMANDS),
         on_hit=_on_barge_hit,
         debug=debug,
     )
@@ -1722,7 +1718,7 @@ def main():
             # STOP/EXIT funktionieren IMMER:
             # - sogar ohne Wake
             # - sogar während speaking
-            if is_stop_command(t):
+            if is_stop_command(t, STOP_COMMANDS):
                 if debug:
                     log(f"Barge-in: stop erkannt -> '{t}'", debug)
                     log("Barge-in: cancel requested (stop)", debug)

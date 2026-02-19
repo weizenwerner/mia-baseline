@@ -1257,6 +1257,137 @@ def is_question_like(text: str) -> bool:
     return False
 
 
+class BargeInMonitor:
+    """Always-on Barge-in via Ringbuffer + tiny Whisper während SPEAKING."""
+
+    def __init__(
+        self,
+        rate: int,
+        whisper_cli: str,
+        whisper_lang: str,
+        barge_model: str,
+        window_sec: float,
+        interval_sec: float,
+        stop_csv: str,
+        on_hit: Callable[[str], None],
+        debug: bool,
+    ):
+        self.rate = rate
+        self.whisper_cli = whisper_cli
+        self.whisper_lang = whisper_lang
+        self.barge_model = barge_model
+        self.window_sec = max(0.6, float(window_sec))
+        self.interval_sec = max(0.15, float(interval_sec))
+        self.stop_csv = stop_csv
+        self.on_hit = on_hit
+        self.debug = debug
+
+        self._samples: Deque[int] = deque(maxlen=max(1, int(self.rate * 2.0)))
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._th_cap: Optional[threading.Thread] = None
+        self._th_scan: Optional[threading.Thread] = None
+        self._last_hit_ts = 0.0
+
+    def start(self) -> None:
+        self._th_cap = threading.Thread(target=self._capture_loop, daemon=True)
+        self._th_scan = threading.Thread(target=self._scan_loop, daemon=True)
+        self._th_cap.start()
+        self._th_scan.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        for th in (self._th_cap, self._th_scan):
+            if th:
+                th.join(timeout=1.5)
+
+    def _append_pcm(self, pcm: bytes) -> None:
+        import array
+        if not pcm:
+            return
+        a = array.array("h")
+        a.frombytes(pcm)
+        with self._lock:
+            self._samples.extend(a.tolist())
+
+    def _snapshot_pcm(self) -> bytes:
+        import array
+        want = max(1, int(self.rate * self.window_sec))
+        with self._lock:
+            if len(self._samples) < want:
+                return b""
+            tail = list(self._samples)[-want:]
+        a = array.array("h", tail)
+        return a.tobytes()
+
+    def _capture_loop(self) -> None:
+        tmp_dir = Path("/tmp/mia_barge_ring")
+        ensure_dir(tmp_dir)
+        while not STOP and not self._stop.is_set():
+            tmp = tmp_dir / f"ring_{uuid.uuid4().hex}.wav"
+            ok = _record_chunk_wav(tmp, rate=self.rate, seconds=0.20, debug=False)
+            if not ok:
+                time.sleep(0.03)
+                continue
+            try:
+                pcm = _read_wav_pcm16_mono(tmp)
+                self._append_pcm(pcm)
+            except Exception:
+                pass
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def _scan_loop(self) -> None:
+        tmp_dir = Path("/tmp/mia_barge_scan")
+        ensure_dir(tmp_dir)
+        while not STOP and not self._stop.is_set():
+            if not SPEAKING.is_set():
+                time.sleep(self.interval_sec)
+                continue
+
+            pcm = self._snapshot_pcm()
+            if not pcm:
+                time.sleep(self.interval_sec)
+                continue
+
+            wav = tmp_dir / f"barge_{uuid.uuid4().hex}.wav"
+            try:
+                with wave.open(str(wav), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(self.rate)
+                    wf.writeframes(pcm)
+
+                txt = whisper_transcribe(
+                    wav,
+                    self.barge_model,
+                    self.whisper_cli,
+                    self.whisper_lang,
+                    debug=False,
+                ).strip()
+                nt = norm_text(txt)
+                if txt and is_stop_command(txt, self.stop_csv):
+                    now = time.time()
+                    if (now - self._last_hit_ts) > 0.8:
+                        self._last_hit_ts = now
+                        if self.debug:
+                            log(f"BARGE HIT text='{txt}' norm='{nt}'", self.debug)
+                        self.on_hit(txt)
+            except Exception:
+                pass
+            finally:
+                try:
+                    wav.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            time.sleep(self.interval_sec)
+
+
+
 # ----------------- main -----------------
 
 def main():
@@ -1309,6 +1440,15 @@ def main():
     whisper_cli = env_str("MIA_WHISPER_CLI", "/data/mia/hear/whisper.cpp/build-cuda/bin/whisper-cli")
     whisper_model = env_str("MIA_WHISPER_MODEL", "/data/mia/hear/whisper.cpp/models/ggml-large-v3.bin")
     whisper_lang = env_str("MIA_WHISPER_LANG", "de")
+
+    # Barge-in (always-on) via tiny Whisper + Ringbuffer
+    barge_whisper_model = env_str("MIA_BARGE_WHISPER_MODEL", "/data/mia/hear/whisper.cpp/models/ggml-tiny.bin")
+    barge_window_sec = env_float("MIA_BARGE_WINDOW_SEC", 1.10)
+    barge_interval_sec = env_float("MIA_BARGE_INTERVAL_SEC", 0.35)
+    barge_stopwords = env_str(
+        "MIA_BARGE_STOPWORDS",
+        "stop,stopp,warte,halt,pause,mia stop,mia stopp,mia warte,mia halt,mia pause,mi stop,mi stopp",
+    )
 
     # Audio/VAD Parameter (normaler Listening-Mode)
     rate = env_int("MIA_RATE", 16000)
@@ -1406,6 +1546,27 @@ def main():
 
     # TTS Manager (Queue + Worker)
     tts_mgr = TTSManager(debug=debug)
+
+    def _on_barge_hit(_txt: str) -> None:
+        CANCEL_TTS.set()
+        tts_mgr.stop(reason="barge")
+
+    barge_mon = BargeInMonitor(
+        rate=rate,
+        whisper_cli=whisper_cli,
+        whisper_lang=whisper_lang,
+        barge_model=barge_whisper_model,
+        window_sec=barge_window_sec,
+        interval_sec=barge_interval_sec,
+        stop_csv=barge_stopwords,
+        on_hit=_on_barge_hit,
+        debug=debug,
+    )
+    barge_mon.start()
+    log(
+        f"Whisper(barge): model={Path(barge_whisper_model).name} window={barge_window_sec:.2f}s interval={barge_interval_sec:.2f}s",
+        debug,
+    )
 
     while not STOP:
         # Wake timeout prüfen
@@ -1634,6 +1795,11 @@ def main():
     # Shutdown: laufende Audioausgabe stoppen
     if tts_stream:
         tts_mgr.stop(reason="shutdown")
+
+    try:
+        barge_mon.stop()
+    except Exception:
+        pass
 
     log("Mia Talk shutdown (graceful).", debug)
 

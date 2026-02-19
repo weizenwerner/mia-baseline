@@ -19,6 +19,7 @@ WICHTIGES DESIGN:
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -345,14 +346,22 @@ def norm_text(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
 
 
+def normalize_cmd(text: str) -> str:
+    """Normalisiert Kommandotext robust gegen Satzzeichen."""
+    t = (text or "").lower()
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def contains_any(text: str, csv_words: str) -> bool:
     """
     Prüft, ob einer der CSV-Phrasen in text vorkommt.
     - text & words normalisiert
     - substring match (w in t)
     """
-    t = norm_text(text)
-    words = [norm_text(w) for w in csv_words.split(",") if w.strip()]
+    t = normalize_cmd(text)
+    words = [normalize_cmd(w) for w in csv_words.split(",") if w.strip()]
     return any(w and (w in t) for w in words)
 
 

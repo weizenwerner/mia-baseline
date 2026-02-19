@@ -69,6 +69,8 @@ CURRENT_PLAY_PID: Optional[int] = None
 # Timestamp wann Playback geendet hat.
 # Wird für Echo-Guard verwendet: kurz nach Playback-Ende sind Echo-Fehltriggers wahrscheinlicher.
 LAST_PLAY_END_TS: float = 0.0
+PREFAB_PLAY_LOCK = threading.Lock()
+PREFAB_ACTIVE = threading.Event()
 
 STOP_COMMANDS: set = set()
 
@@ -1044,10 +1046,39 @@ def play_wav(wav: Path, debug: bool, turn_id: Optional[str] = None) -> None:
 
 
 def play_prefab_wav(wav: Path, debug: bool) -> None:
-    """Spielt ein vorgefertigtes WAV für Intro-Filler ab."""
-    if not wav.exists():
+    """Spielt ein vorgefertigtes WAV asynchron via pw-play (non-blocking)."""
+    global CURRENT_PLAY_PID, LAST_PLAY_END_TS
+    if not wav.exists() or PREFAB_ACTIVE.is_set():
         return
-    play_wav(wav, debug, turn_id=None)
+
+    def _run() -> None:
+        with PREFAB_PLAY_LOCK:
+            if PREFAB_ACTIVE.is_set():
+                return
+            PREFAB_ACTIVE.set()
+
+        SPEAKING.set()
+        p = None
+        try:
+            p = subprocess.Popen(["pw-play", str(wav)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            CURRENT_PLAY_PID = p.pid
+            while p.poll() is None:
+                if STOP or CANCEL_TTS.is_set():
+                    stop_playback(debug)
+                    return
+                time.sleep(0.02)
+        finally:
+            try:
+                if p and p.poll() is None:
+                    p.kill()
+            except Exception:
+                pass
+            CURRENT_PLAY_PID = None
+            LAST_PLAY_END_TS = time.time()
+            SPEAKING.clear()
+            PREFAB_ACTIVE.clear()
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 class TTSManager:
@@ -1529,11 +1560,11 @@ def main():
     tts_intro_texts = [x.strip() for x in tts_intro_texts_raw.split(",") if x.strip()]
     tts_intro_cooldown_sec = env_float("MIA_TTS_INTRO_COOLDOWN_SEC", 8.0)
 
-    intro_filler_enabled = env_bool("MIA_INTRO_FILLER_ENABLED", True)
-    intro_filler_delay_sec = env_float("MIA_INTRO_FILLER_DELAY_SEC", 0.35)
-    intro_filler_wavs_raw = env_str("MIA_INTRO_FILLER_WAVS", "")
-    intro_filler_wavs = [Path(x.strip()) for x in intro_filler_wavs_raw.split(",") if x.strip()]
-    intro_filler_cooldown_sec = env_float("MIA_INTRO_FILLER_COOLDOWN_SEC", 6.0)
+    prefab_enabled = env_bool("MIA_PREFAB_INTRO", True)
+    prefab_dir = Path(env_str("MIA_PREFAB_DIR", "/data/mia/repo_2/data/audio/prefabs"))
+    prefab_prob = max(0.0, min(1.0, env_float("MIA_PREFAB_PROB", 0.7)))
+    prefab_cooldown_sec = env_float("MIA_PREFAB_COOLDOWN_SEC", 8.0)
+    prefab_files = sorted([x for x in prefab_dir.glob("*.wav") if x.is_file()])
 
     # Echo guard Parameter
     echo_overlap = env_float("MIA_ECHO_OVERLAP", 0.45)
@@ -1581,9 +1612,12 @@ def main():
         debug,
     )
     log(
-        f"IntroFiller: enabled={intro_filler_enabled} delay={intro_filler_delay_sec:.2f}s cooldown={intro_filler_cooldown_sec:.1f}s wavs={len(intro_filler_wavs)}",
+        f"Prefab intro: enabled={prefab_enabled} prob={prefab_prob:.2f} cooldown={prefab_cooldown_sec:.1f}s dir={prefab_dir}",
         debug,
     )
+    log(f"Prefabs loaded: {len(prefab_files)} files", debug)
+    if prefab_enabled and not prefab_files:
+        log(f"WARN: Prefab dir has no wav files: {prefab_dir}", debug)
     log(f"Stopwords: {stopwords}", debug)
     log(f"Echo guard: overlap>={echo_overlap:.2f} history={echo_history} window={echo_window_sec:.2f}s", debug)
 
@@ -1612,7 +1646,7 @@ def main():
     # TTS Manager (Queue + Worker)
     tts_mgr = TTSManager(debug=debug)
     last_intro_ts = 0.0
-    last_intro_filler_ts = 0.0
+    last_prefab_time = 0.0
 
     def _on_barge_hit(_txt: str) -> None:
         CANCEL_TTS.set()
@@ -1797,25 +1831,13 @@ def main():
                 if tts_stream:
                     arm_intro = {"v": True}
 
-                    def _intro_filler_timer() -> None:
-                        nonlocal last_intro_filler_ts
-                        time.sleep(max(0.0, intro_filler_delay_sec))
-                        if STOP or CANCEL_TTS.is_set() or (not arm_intro["v"]):
-                            return
-                        if not intro_filler_enabled:
-                            return
-                        if (time.time() - last_intro_filler_ts) < intro_filler_cooldown_sec:
-                            return
-                        wavs_ok = [w for w in intro_filler_wavs if w.exists()]
-                        if not wavs_ok:
-                            return
-                        pick = random.choice(wavs_ok)
-                        last_intro_filler_ts = time.time()
-                        if debug:
-                            log(f"IntroFiller: played {pick} (delay hit)", debug)
-                        play_prefab_wav(pick, debug)
-
-                    threading.Thread(target=_intro_filler_timer, daemon=True).start()
+                    if prefab_enabled and prefab_files:
+                        now_pf = time.time()
+                        if (now_pf - last_prefab_time) >= prefab_cooldown_sec and random.random() < prefab_prob:
+                            chosen = random.choice(prefab_files)
+                            log(f"Prefab: play {chosen.name}", debug)
+                            play_prefab_wav(chosen, debug)
+                            last_prefab_time = now_pf
 
                     if tts_intro_enable and tts_intro_texts and (time.time() - last_intro_ts) >= tts_intro_cooldown_sec:
                         intro = tts_intro_texts[int(time.time()) % len(tts_intro_texts)]

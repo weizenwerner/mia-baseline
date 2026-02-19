@@ -71,6 +71,9 @@ LAST_PLAY_END_TS: float = 0.0
 
 STOP_COMMANDS: set = set()
 
+# Serialisiert Mikrofonzugriffe (Main-VAD vs. Barge-in), um pw-record Konkurrenz zu vermeiden.
+MIC_RECORD_LOCK = threading.Lock()
+
 # Optionales Timing-Trace pro Turn
 TRACE_TIMINGS = False
 TRACE_LOCK = threading.Lock()
@@ -552,7 +555,8 @@ def _record_chunk_wav(tmp_wav: Path, rate: int, seconds: float, debug: bool) -> 
         "--format", "s16",
         str(tmp_wav),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    with MIC_RECORD_LOCK:
+        r = subprocess.run(cmd, capture_output=True, text=True)
 
     # wenn WAV existiert und > ~1KB -> ok
     if tmp_wav.exists() and tmp_wav.stat().st_size > 1000:
@@ -1318,7 +1322,7 @@ def is_question_like(text: str) -> bool:
 
 
 class BargeInMonitor:
-    """Always-on Barge-in via Ringbuffer + tiny Whisper während SPEAKING."""
+    """Barge-in Scanner während SPEAKING (ein Loop, kein Doppel-pw-record)."""
 
     def __init__(
         self,
@@ -1342,84 +1346,47 @@ class BargeInMonitor:
         self.on_hit = on_hit
         self.debug = debug
 
-        self._samples: Deque[int] = deque(maxlen=max(1, int(self.rate * 2.0)))
-        self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._th_cap: Optional[threading.Thread] = None
         self._th_scan: Optional[threading.Thread] = None
         self._last_hit_ts = 0.0
 
     def start(self) -> None:
-        self._th_cap = threading.Thread(target=self._capture_loop, daemon=True)
         self._th_scan = threading.Thread(target=self._scan_loop, daemon=True)
-        self._th_cap.start()
         self._th_scan.start()
 
     def stop(self) -> None:
         self._stop.set()
-        for th in (self._th_cap, self._th_scan):
-            if th:
-                th.join(timeout=1.5)
-
-    def _append_pcm(self, pcm: bytes) -> None:
-        import array
-        if not pcm:
-            return
-        a = array.array("h")
-        a.frombytes(pcm)
-        with self._lock:
-            self._samples.extend(a.tolist())
-
-    def _snapshot_pcm(self) -> bytes:
-        import array
-        want = max(1, int(self.rate * self.window_sec))
-        with self._lock:
-            if len(self._samples) < want:
-                return b""
-            tail = list(self._samples)[-want:]
-        a = array.array("h", tail)
-        return a.tobytes()
-
-    def _capture_loop(self) -> None:
-        tmp_dir = Path("/tmp/mia_barge_ring")
-        ensure_dir(tmp_dir)
-        while not STOP and not self._stop.is_set():
-            tmp = tmp_dir / f"ring_{uuid.uuid4().hex}.wav"
-            ok = _record_chunk_wav(tmp, rate=self.rate, seconds=0.20, debug=False)
-            if not ok:
-                time.sleep(0.03)
-                continue
-            try:
-                pcm = _read_wav_pcm16_mono(tmp)
-                self._append_pcm(pcm)
-            except Exception:
-                pass
-            finally:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        if self._th_scan:
+            self._th_scan.join(timeout=1.5)
 
     def _scan_loop(self) -> None:
+        """
+        Scannt Stop-Phrasen nur während SPEAKING:
+        - nimmt pro Scan genau ein kurzes WAV auf (window_sec)
+        - nutzt dieses WAV direkt für tiny-whisper
+
+        Dadurch entfällt der frühere Doppelpfad (capture-loop + scan-loop)
+        und die I/O Last sinkt deutlich.
+        """
         tmp_dir = Path("/tmp/mia_barge_scan")
         ensure_dir(tmp_dir)
+
         while not STOP and not self._stop.is_set():
             if not SPEAKING.is_set():
                 time.sleep(self.interval_sec)
                 continue
 
-            pcm = self._snapshot_pcm()
-            if not pcm:
-                time.sleep(self.interval_sec)
-                continue
-
             wav = tmp_dir / f"barge_{uuid.uuid4().hex}.wav"
             try:
-                with wave.open(str(wav), "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(self.rate)
-                    wf.writeframes(pcm)
+                ok = _record_chunk_wav(
+                    wav,
+                    rate=self.rate,
+                    seconds=self.window_sec,
+                    debug=False,
+                )
+                if not ok:
+                    time.sleep(self.interval_sec)
+                    continue
 
                 txt = whisper_transcribe(
                     wav,
@@ -1428,6 +1395,7 @@ class BargeInMonitor:
                     self.whisper_lang,
                     debug=False,
                 ).strip()
+
                 nt = norm_text(txt)
                 if txt and self.is_stop_match(txt):
                     now = time.time()
@@ -1445,7 +1413,6 @@ class BargeInMonitor:
                     pass
 
             time.sleep(self.interval_sec)
-
 
 
 # ----------------- main -----------------

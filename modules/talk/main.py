@@ -1493,13 +1493,6 @@ def main():
     max_sec = env_int("MIA_MAX_SEC", 15)
     rms_threshold = env_int("MIA_RMS_THRESHOLD", 420)
 
-    # "While speaking" Listening-Parameter:
-    # während Playback wollen wir kurz und strikt nur STOP/ENDE hören
-    speak_listen_max_sec = env_int("MIA_SPEAK_LISTEN_MAX_SEC", 4)
-    speak_silence_limit = env_float("MIA_SPEAK_SILENCE_LIMIT_SEC", 0.5)
-    speak_min_speech = env_float("MIA_SPEAK_MIN_SPEECH_SEC", 0.20)
-    speak_rms_threshold = env_int("MIA_SPEAK_RMS_THRESHOLD", 650)
-
     # Wake/Exit
     require_wake = env_bool("MIA_REQUIRE_WAKE", True)
     wakewords = env_str("MIA_WAKEWORDS", "hey mia,mia")
@@ -1620,6 +1613,8 @@ def main():
         debug,
     )
 
+    speaking_wait_logged = False
+
     while not STOP:
         # Wake timeout prüfen
         if awake and time.time() > awake_until:
@@ -1630,19 +1625,19 @@ def main():
         # SPEAKING = Audioausgabe aktiv
         speaking_now = SPEAKING.is_set()
         if speaking_now:
-            log(">>> Ich höre zu (STOP/ENDE während Mia spricht)…", debug)
-        else:
-            log(">>> Ich höre zu (sprich jetzt)…", debug)
+            if debug and not speaking_wait_logged:
+                speaking_wait_logged = True
+                log(">>> Mia spricht: Main-Loop wartet passiv (Barge-in only).", debug)
+            while not STOP and SPEAKING.is_set():
+                time.sleep(0.05)
+            continue
+
+        speaking_wait_logged = False
+        log(">>> Ich höre zu (sprich jetzt)…", debug)
 
         # Aufnahme-Dateiname
         utt_id = str(uuid.uuid4())
         in_wav = tmp_dir / f"mia_in_{utt_id}.wav"
-
-        # Während speaking: kurze Aufnahme & strenger threshold (nur stop/ende)
-        _max_sec = speak_listen_max_sec if speaking_now else max_sec
-        _silence = speak_silence_limit if speaking_now else silence_limit
-        _minsp = speak_min_speech if speaking_now else min_speech
-        _rms = speak_rms_threshold if speaking_now else rms_threshold
 
         # Audio aufnehmen bis VAD "speech segment" erkannt hat
         t0_record = time.perf_counter()
@@ -1651,12 +1646,12 @@ def main():
             rate=rate,
             frame_ms=frame_ms,
             vad_mode=vad_mode,
-            silence_limit_sec=_silence,
-            min_speech_sec=_minsp,
+            silence_limit_sec=silence_limit,
+            min_speech_sec=min_speech,
             trigger_ratio=trigger_ratio,
             ring_ms=ring_ms,
-            max_sec=_max_sec,
-            rms_threshold=_rms,
+            max_sec=max_sec,
+            rms_threshold=rms_threshold,
             debug=debug,
         )
         t_record = time.perf_counter() - t0_record
@@ -1700,9 +1695,8 @@ def main():
             if is_noise_transcript(t):
                 continue
 
-            # STOP/EXIT funktionieren IMMER:
-            # - sogar ohne Wake
-            # - sogar während speaking
+            # STOP funktioniert hier im Nicht-SPEAKING-Modus weiterhin.
+            # Voice-Exit wird ebenfalls nur hier (nicht während SPEAKING) geprüft.
             if is_stop_command(t, STOP_COMMANDS):
                 if debug:
                     log(f"Barge-in: stop erkannt -> '{t}'", debug)
@@ -1715,12 +1709,6 @@ def main():
             if contains_any(t, exitwords):
                 log(f"Exit erkannt: '{t}' -> shutdown.", debug)
                 break
-
-            # Während speaking werden alle Nicht-Stop Inputs ignoriert
-            if speaking_now:
-                if debug:
-                    log(f"Speaking -> ignored (non-stop): '{t}'", debug)
-                continue
 
             # Wakeword prüfen
             woke_now = contains_any(t, wakewords)

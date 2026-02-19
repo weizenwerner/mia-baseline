@@ -20,6 +20,7 @@ WICHTIGES DESIGN:
 
 import os
 import re
+import random
 import sys
 import json
 import time
@@ -824,19 +825,29 @@ def is_noise_transcript(t: str) -> bool:
 
 # ----------------- Ollama -----------------
 
-def ollama_warmup_cli(model: str, keepalive: str) -> float:
-    """
-    Warmup über 'ollama run' CLI:
-    - lädt Modell / cache / initialisiert
-    - damit erste Antwort schneller
-    """
-    t0 = time.time()
-    cmd = ["ollama", "run", model]
-    if keepalive:
-        cmd += ["--keepalive", keepalive]
-    cmd += ["Sag nur OK."]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    return time.time() - t0
+def ollama_warmup_http(host: str, model: str, keepalive: str) -> float:
+    """Warmup über Ollama HTTP /api/chat mit kleiner Antwortlänge."""
+    if requests is None:
+        raise RuntimeError("Python 'requests' not installed (needed for warmup HTTP).")
+
+    url = host.rstrip("/") + "/api/chat"
+    t0 = time.perf_counter()
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Sag nur: OK."}],
+        "stream": False,
+        "keep_alive": keepalive,
+        "options": {
+            "num_predict": 20,
+            "temperature": env_float("MIA_TEMPERATURE", 0.2),
+            "top_p": env_float("MIA_TOP_P", 0.9),
+            "repeat_penalty": env_float("MIA_REPEAT_PENALTY", 1.1),
+        },
+    }
+    r = requests.post(url, json=payload, timeout=45)
+    if r.status_code >= 400:
+        raise RuntimeError(f"warmup http failed {r.status_code}: {(r.text or '')[:300]}")
+    return time.perf_counter() - t0
 
 
 def ollama_chat_http_stream(
@@ -1037,6 +1048,13 @@ def play_wav(wav: Path, debug: bool, turn_id: Optional[str] = None) -> None:
         CURRENT_PLAY_PID = None
         LAST_PLAY_END_TS = time.time()
         SPEAKING.clear()
+
+
+def play_prefab_wav(wav: Path, debug: bool) -> None:
+    """Spielt ein vorgefertigtes WAV für Intro-Filler ab."""
+    if not wav.exists():
+        return
+    play_wav(wav, debug, turn_id=None)
 
 
 class TTSManager:
@@ -1455,7 +1473,7 @@ def main():
     # Ollama Konfig
     ollama_host = env_str("MIA_OLLAMA_HOST", "http://127.0.0.1:11434")
     model = env_str("MIA_LLM", "mia-talk-72b:latest")
-    keepalive = env_str("MIA_KEEPALIVE", "-1m")
+    keepalive = env_str("MIA_KEEPALIVE", "-1")
     warmup = env_bool("MIA_WARMUP", True)
 
     # Whisper Konfig
@@ -1516,6 +1534,12 @@ def main():
     tts_intro_texts = [x.strip() for x in tts_intro_texts_raw.split(",") if x.strip()]
     tts_intro_cooldown_sec = env_float("MIA_TTS_INTRO_COOLDOWN_SEC", 8.0)
 
+    intro_filler_enabled = env_bool("MIA_INTRO_FILLER_ENABLED", True)
+    intro_filler_delay_sec = env_float("MIA_INTRO_FILLER_DELAY_SEC", 0.35)
+    intro_filler_wavs_raw = env_str("MIA_INTRO_FILLER_WAVS", "")
+    intro_filler_wavs = [Path(x.strip()) for x in intro_filler_wavs_raw.split(",") if x.strip()]
+    intro_filler_cooldown_sec = env_float("MIA_INTRO_FILLER_COOLDOWN_SEC", 6.0)
+
     # Echo guard Parameter
     echo_overlap = env_float("MIA_ECHO_OVERLAP", 0.45)
     echo_history = env_int("MIA_ECHO_HISTORY", 12)
@@ -1561,13 +1585,20 @@ def main():
         f"TTS intro: enabled={tts_intro_enable} cooldown={tts_intro_cooldown_sec:.1f}s texts={len(tts_intro_texts)}",
         debug,
     )
+    log(
+        f"IntroFiller: enabled={intro_filler_enabled} delay={intro_filler_delay_sec:.2f}s cooldown={intro_filler_cooldown_sec:.1f}s wavs={len(intro_filler_wavs)}",
+        debug,
+    )
     log(f"Stopwords: {stopwords}", debug)
     log(f"Echo guard: overlap>={echo_overlap:.2f} history={echo_history} window={echo_window_sec:.2f}s", debug)
 
     # Warmup
     if warmup:
-        dt = ollama_warmup_cli(model, keepalive)
-        log(f"Mia warmup fertig nach {dt:.1f}s.", debug)
+        try:
+            dt = ollama_warmup_http(ollama_host, model, keepalive)
+            log(f"Warmup: http done in {dt:.2f}s", debug)
+        except Exception as e:
+            log(f"Warmup HTTP ERROR: {e}", debug)
 
     # temp input wavs
     tmp_dir = Path("/tmp/mia_talk")
@@ -1586,6 +1617,7 @@ def main():
     # TTS Manager (Queue + Worker)
     tts_mgr = TTSManager(debug=debug)
     last_intro_ts = 0.0
+    last_intro_filler_ts = 0.0
 
     def _on_barge_hit(_txt: str) -> None:
         CANCEL_TTS.set()
@@ -1716,6 +1748,14 @@ def main():
                 awake_until = time.time() + float(awake_timeout_sec)
                 if debug:
                     log(f"Wake erkannt -> Mia ist wach für {awake_timeout_sec}s.", debug)
+                if warmup:
+                    def _wake_warmup():
+                        try:
+                            dt_w = ollama_warmup_http(ollama_host, model, keepalive)
+                            log(f"Warmup: http done in {dt_w:.2f}s", debug)
+                        except Exception as e:
+                            log(f"Warmup HTTP ERROR: {e}", debug)
+                    threading.Thread(target=_wake_warmup, daemon=True).start()
 
             # require_wake: wenn nicht awake -> ignorieren
             if require_wake and not awake:
@@ -1759,6 +1799,28 @@ def main():
 
                 t0_ollama = time.perf_counter()
                 if tts_stream:
+                    arm_intro = {"v": True}
+
+                    def _intro_filler_timer() -> None:
+                        nonlocal last_intro_filler_ts
+                        time.sleep(max(0.0, intro_filler_delay_sec))
+                        if STOP or CANCEL_TTS.is_set() or (not arm_intro["v"]):
+                            return
+                        if not intro_filler_enabled:
+                            return
+                        if (time.time() - last_intro_filler_ts) < intro_filler_cooldown_sec:
+                            return
+                        wavs_ok = [w for w in intro_filler_wavs if w.exists()]
+                        if not wavs_ok:
+                            return
+                        pick = random.choice(wavs_ok)
+                        last_intro_filler_ts = time.time()
+                        if debug:
+                            log(f"IntroFiller: played {pick} (delay hit)", debug)
+                        play_prefab_wav(pick, debug)
+
+                    threading.Thread(target=_intro_filler_timer, daemon=True).start()
+
                     if tts_intro_enable and tts_intro_texts and (time.time() - last_intro_ts) >= tts_intro_cooldown_sec:
                         intro = tts_intro_texts[int(time.time()) % len(tts_intro_texts)]
                         tts_mgr.enqueue(intro, turn_id=turn_id)
@@ -1766,8 +1828,13 @@ def main():
 
                     # Wenn ein Chunk fertig ist -> in TTS Queue
                     def emit_chunk(txt: str):
+                        nonlocal arm_intro
                         if STOP or CANCEL_TTS.is_set():
                             return
+                        if arm_intro["v"]:
+                            arm_intro["v"] = False
+                            if debug:
+                                log(f"First real chunk emitted at t={time.perf_counter() - t0_ollama:.2f}s", debug)
                         tts_mgr.enqueue(txt, turn_id=turn_id)
                         recent_assistant.append(txt)
 
@@ -1792,6 +1859,7 @@ def main():
                     assistant = ollama_chat_http_stream(
                         ollama_host, model, keepalive, sess["messages"], debug, on_delta=on_delta
                     )
+                    arm_intro["v"] = False
                     # Rest raus
                     chunker.flush()
                 else:

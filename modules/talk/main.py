@@ -1149,11 +1149,33 @@ class StreamChunker:
     - min_chars / max_chars steuern, ab wann ein Chunk rausgeht
     """
 
-    def __init__(self, emit: Callable[[str], None], min_chars: int, max_chars: int):
+    def __init__(
+        self,
+        emit: Callable[[str], None],
+        min_chars: int,
+        max_chars: int,
+        adaptive: bool = False,
+        phase1_sec: float = 1.2,
+        phase2_sec: float = 3.5,
+    ):
         self.emit = emit
         self.min_chars = min_chars
         self.max_chars = max_chars
         self.buf = ""
+        self.adaptive = adaptive
+        self.phase1_sec = max(0.1, phase1_sec)
+        self.phase2_sec = max(self.phase1_sec, phase2_sec)
+        self.t0 = time.perf_counter()
+
+    def _limits(self) -> Tuple[int, int]:
+        if not self.adaptive:
+            return self.min_chars, self.max_chars
+        dt = time.perf_counter() - self.t0
+        if dt < self.phase1_sec:
+            return max(20, int(self.min_chars * 0.45)), max(60, int(self.max_chars * 0.55))
+        if dt < self.phase2_sec:
+            return max(35, int(self.min_chars * 0.70)), max(90, int(self.max_chars * 0.80))
+        return self.min_chars, self.max_chars
 
     def push(self, delta: str):
         """Nimmt neue Textdeltas auf und emittiert ggf. fertige Chunks."""
@@ -1169,13 +1191,16 @@ class StreamChunker:
             self.buf = right
 
         # 2) chunking bei Satzzeichen, sobald min_chars erreicht
-        while len(self.buf) >= self.min_chars:
-            cut = self.buf[: self.max_chars]
+        while True:
+            min_chars, max_chars = self._limits()
+            if len(self.buf) < min_chars:
+                break
+            cut = self.buf[: max_chars]
             idx = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
             if idx == -1:
                 # kein Satzende gefunden:
                 # wenn Buffer viel zu groß -> am letzten Space trennen
-                if len(self.buf) > self.max_chars:
+                if len(self.buf) > max_chars:
                     sp = cut.rfind(" ")
                     if sp > 0:
                         self.emit(self.buf[:sp].strip())
@@ -1479,6 +1504,17 @@ def main():
     tts_stream = env_bool("MIA_TTS_STREAM", True)
     tts_min_chars = env_int("MIA_TTS_STREAM_MIN_CHARS", 80)
     tts_max_chars = env_int("MIA_TTS_STREAM_MAX_CHARS", 180)
+    tts_adaptive_chunking = env_bool("MIA_TTS_ADAPTIVE_CHUNKING", True)
+    tts_phase1_sec = env_float("MIA_TTS_PHASE1_SEC", 1.2)
+    tts_phase2_sec = env_float("MIA_TTS_PHASE2_SEC", 3.5)
+
+    tts_intro_enable = env_bool("MIA_TTS_INTRO_ENABLE", True)
+    tts_intro_texts_raw = env_str(
+        "MIA_TTS_INTRO_TEXTS",
+        "okay...,einen moment...,lass mich kurz nachdenken...",
+    )
+    tts_intro_texts = [x.strip() for x in tts_intro_texts_raw.split(",") if x.strip()]
+    tts_intro_cooldown_sec = env_float("MIA_TTS_INTRO_COOLDOWN_SEC", 8.0)
 
     # Echo guard Parameter
     echo_overlap = env_float("MIA_ECHO_OVERLAP", 0.45)
@@ -1517,6 +1553,14 @@ def main():
     log(f"Wake: require_wake={require_wake} awake_timeout_sec={awake_timeout_sec}", debug)
     log(f"Logfile: {LOG_FILE}", debug)
     log(f"TTS stream: {tts_stream} min_chars={tts_min_chars} max_chars={tts_max_chars}", debug)
+    log(
+        f"TTS adaptive: enabled={tts_adaptive_chunking} p1={tts_phase1_sec:.2f}s p2={tts_phase2_sec:.2f}s",
+        debug,
+    )
+    log(
+        f"TTS intro: enabled={tts_intro_enable} cooldown={tts_intro_cooldown_sec:.1f}s texts={len(tts_intro_texts)}",
+        debug,
+    )
     log(f"Stopwords: {stopwords}", debug)
     log(f"Echo guard: overlap>={echo_overlap:.2f} history={echo_history} window={echo_window_sec:.2f}s", debug)
 
@@ -1541,6 +1585,7 @@ def main():
 
     # TTS Manager (Queue + Worker)
     tts_mgr = TTSManager(debug=debug)
+    last_intro_ts = 0.0
 
     def _on_barge_hit(_txt: str) -> None:
         CANCEL_TTS.set()
@@ -1714,6 +1759,11 @@ def main():
 
                 t0_ollama = time.perf_counter()
                 if tts_stream:
+                    if tts_intro_enable and tts_intro_texts and (time.time() - last_intro_ts) >= tts_intro_cooldown_sec:
+                        intro = tts_intro_texts[int(time.time()) % len(tts_intro_texts)]
+                        tts_mgr.enqueue(intro, turn_id=turn_id)
+                        last_intro_ts = time.time()
+
                     # Wenn ein Chunk fertig ist -> in TTS Queue
                     def emit_chunk(txt: str):
                         if STOP or CANCEL_TTS.is_set():
@@ -1721,7 +1771,14 @@ def main():
                         tts_mgr.enqueue(txt, turn_id=turn_id)
                         recent_assistant.append(txt)
 
-                    chunker = StreamChunker(emit=emit_chunk, min_chars=tts_min_chars, max_chars=tts_max_chars)
+                    chunker = StreamChunker(
+                        emit=emit_chunk,
+                        min_chars=tts_min_chars,
+                        max_chars=tts_max_chars,
+                        adaptive=tts_adaptive_chunking,
+                        phase1_sec=tts_phase1_sec,
+                        phase2_sec=tts_phase2_sec,
+                    )
 
                     # Bei jedem LLM delta -> chunker.push
                     def on_delta(delta: str):

@@ -1404,7 +1404,7 @@ def main():
         - TTS chunks enqueuen
         - Session speichern
     """
-    global LAST_PLAY_END_TS, TRACE_TIMINGS
+    global LAST_PLAY_END_TS, TRACE_TIMINGS, STOP_COMMANDS
 
     # Optionales env-file laden (für direkten Python-Start ohne run.sh)
     load_local_env_file(Path(__file__).with_name("config.env"), debug=False)
@@ -1468,7 +1468,12 @@ def main():
     awake_timeout_sec = env_int("MIA_AWAKE_TIMEOUT_SEC", 180)
 
     # Stop/Barge-in
-    stopwords = ",".join(sorted(STOP_COMMANDS))
+    stopwords_raw = env_str("MIA_STOPWORDS", "stop,stopp,pause,mia stop,mia stopp,mia pause")
+    stopwords_list = [normalize_cmd(x) for x in stopwords_raw.split(",") if normalize_cmd(x)]
+    STOP_COMMANDS = set(stopwords_list) if stopwords_list else {
+        "stop", "stopp", "pause", "mia stop", "mia stopp", "mia pause"
+    }
+    stopwords = stopwords_raw
 
     # TTS streaming: LLM deltas werden in Chunks gesprochen
     tts_stream = env_bool("MIA_TTS_STREAM", True)

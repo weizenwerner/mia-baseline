@@ -62,6 +62,10 @@ CANCEL_TTS = threading.Event()
 # (nicht: "TTS-Thread existiert")
 SPEAKING = threading.Event()
 
+# Stabiler Audio-Ausgabe-Modus (über gesamten Antwort-Turn inkl. Chunk-Lücken).
+AUDIO_OUT_ACTIVE = threading.Event()
+AUDIO_OUT_LAST_ACTIVE_TS: float = 0.0
+
 # Optional: PID des aktuell laufenden pw-play Prozesses (nur informativ)
 CURRENT_PLAY_PID: Optional[int] = None
 
@@ -975,6 +979,7 @@ def clean_for_tts(text: str) -> str:
 
 
 def piper_speak(text: str, debug: bool, turn_id: Optional[str] = None) -> Path:
+    global AUDIO_OUT_LAST_ACTIVE_TS
     """
     Piper TTS:
     - erzeugt WAV in AUDIO_OUT_DIR
@@ -995,6 +1000,7 @@ def piper_speak(text: str, debug: bool, turn_id: Optional[str] = None) -> Path:
 
     # Ab hier gilt: sie spricht / ist busy
     SPEAKING.set()
+    AUDIO_OUT_LAST_ACTIVE_TS = time.time()
 
     t0 = time.perf_counter()
     r = subprocess.run(cmd, input=text, text=True, capture_output=True)
@@ -1021,7 +1027,7 @@ def play_wav(wav: Path, debug: bool, turn_id: Optional[str] = None) -> None:
     - checkt STOP/CANCEL_TTS in Schleife -> Barge-in kann abbrechen
     - aktualisiert LAST_PLAY_END_TS am Ende
     """
-    global CURRENT_PLAY_PID, LAST_PLAY_END_TS
+    global CURRENT_PLAY_PID, LAST_PLAY_END_TS, AUDIO_OUT_LAST_ACTIVE_TS
     if STOP or CANCEL_TTS.is_set():
         SPEAKING.clear()
         return
@@ -1055,6 +1061,7 @@ def play_wav(wav: Path, debug: bool, turn_id: Optional[str] = None) -> None:
             pass
         CURRENT_PLAY_PID = None
         LAST_PLAY_END_TS = time.time()
+        AUDIO_OUT_LAST_ACTIVE_TS = LAST_PLAY_END_TS
         SPEAKING.clear()
 
 
@@ -1113,6 +1120,7 @@ class TTSManager:
                 self.th.join(timeout=2.0)
             self.th = None
         SPEAKING.clear()
+        AUDIO_OUT_ACTIVE.clear()
         if self.debug:
             log(f"TTS: stopped ({reason})", self.debug)
 
@@ -1128,6 +1136,8 @@ class TTSManager:
 
     def _worker(self) -> None:
         """Worker-Schleife: nimmt Texte aus Queue und spricht sie."""
+        global AUDIO_OUT_LAST_ACTIVE_TS
+        grace_sec = 0.4
         try:
             while not STOP:
                 item = self.q.get()
@@ -1142,6 +1152,10 @@ class TTSManager:
                 if not txt:
                     trace_mark_chunk_done(item_turn_id)
                     continue
+
+                # stabiler Sprech-Modus über Chunk-Grenzen hinweg
+                AUDIO_OUT_ACTIVE.set()
+                AUDIO_OUT_LAST_ACTIVE_TS = time.time()
 
                 wav: Optional[Path] = None
                 try:
@@ -1160,8 +1174,17 @@ class TTSManager:
                         except Exception:
                             pass
                     trace_mark_chunk_done(item_turn_id)
+                    AUDIO_OUT_LAST_ACTIVE_TS = time.time()
+
+                # Nur clearen wenn wirklich idle + kurze Grace-Phase gegen Flackern.
+                while (not STOP) and (not CANCEL_TTS.is_set()) and self.q.empty() and (CURRENT_PLAY_PID is None) and (not SPEAKING.is_set()):
+                    if (time.time() - AUDIO_OUT_LAST_ACTIVE_TS) > grace_sec:
+                        AUDIO_OUT_ACTIVE.clear()
+                        break
+                    time.sleep(0.05)
         finally:
             SPEAKING.clear()
+            AUDIO_OUT_ACTIVE.clear()
 
 
 class StreamChunker:
@@ -1380,7 +1403,7 @@ class BargeInMonitor:
         ensure_dir(tmp_dir)
 
         while not STOP and not self._stop.is_set():
-            if not SPEAKING.is_set():
+            if not AUDIO_OUT_ACTIVE.is_set():
                 time.sleep(self.interval_sec)
                 continue
 
@@ -1622,13 +1645,13 @@ def main():
             if debug:
                 log("Awake timeout: Mia schläft wieder (Wakeword nötig).", debug)
 
-        # SPEAKING = Audioausgabe aktiv
-        speaking_now = SPEAKING.is_set()
+        # AUDIO_OUT_ACTIVE = stabiler Audio-Ausgabe-Modus
+        speaking_now = AUDIO_OUT_ACTIVE.is_set()
         if speaking_now:
             if debug and not speaking_wait_logged:
                 speaking_wait_logged = True
                 log(">>> Mia spricht: Main-Loop wartet passiv (Barge-in only).", debug)
-            while not STOP and SPEAKING.is_set():
+            while not STOP and AUDIO_OUT_ACTIVE.is_set():
                 time.sleep(0.05)
             continue
 

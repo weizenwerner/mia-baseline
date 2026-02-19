@@ -20,7 +20,6 @@ WICHTIGES DESIGN:
 
 import os
 import re
-import random
 import sys
 import json
 import time
@@ -69,8 +68,6 @@ CURRENT_PLAY_PID: Optional[int] = None
 # Timestamp wann Playback geendet hat.
 # Wird für Echo-Guard verwendet: kurz nach Playback-Ende sind Echo-Fehltriggers wahrscheinlicher.
 LAST_PLAY_END_TS: float = 0.0
-PREFAB_PLAY_LOCK = threading.Lock()
-PREFAB_ACTIVE = threading.Event()
 
 STOP_COMMANDS: set = set()
 
@@ -1045,42 +1042,6 @@ def play_wav(wav: Path, debug: bool, turn_id: Optional[str] = None) -> None:
         SPEAKING.clear()
 
 
-def play_prefab_wav(wav: Path, debug: bool) -> None:
-    """Spielt ein vorgefertigtes WAV asynchron via pw-play (non-blocking)."""
-    global CURRENT_PLAY_PID, LAST_PLAY_END_TS
-    if not wav.exists() or PREFAB_ACTIVE.is_set():
-        return
-
-    def _run() -> None:
-        with PREFAB_PLAY_LOCK:
-            if PREFAB_ACTIVE.is_set():
-                return
-            PREFAB_ACTIVE.set()
-
-        SPEAKING.set()
-        p = None
-        try:
-            p = subprocess.Popen(["pw-play", str(wav)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            CURRENT_PLAY_PID = p.pid
-            while p.poll() is None:
-                if STOP or CANCEL_TTS.is_set():
-                    stop_playback(debug)
-                    return
-                time.sleep(0.02)
-        finally:
-            try:
-                if p and p.poll() is None:
-                    p.kill()
-            except Exception:
-                pass
-            CURRENT_PLAY_PID = None
-            LAST_PLAY_END_TS = time.time()
-            SPEAKING.clear()
-            PREFAB_ACTIVE.clear()
-
-    threading.Thread(target=_run, daemon=True).start()
-
-
 class TTSManager:
     """
     TTSManager:
@@ -1199,6 +1160,8 @@ class StreamChunker:
         adaptive: bool = False,
         phase1_sec: float = 1.2,
         phase2_sec: float = 3.5,
+        first_min_chars: int = 25,
+        first_max_wait_sec: float = 0.8,
     ):
         self.emit = emit
         self.min_chars = min_chars
@@ -1208,6 +1171,17 @@ class StreamChunker:
         self.phase1_sec = max(0.1, phase1_sec)
         self.phase2_sec = max(self.phase1_sec, phase2_sec)
         self.t0 = time.perf_counter()
+        self.first_min_chars = max(1, int(first_min_chars))
+        self.first_max_wait_sec = max(0.05, float(first_max_wait_sec))
+        self.first_token_ts: Optional[float] = None
+        self.first_chunk_emitted = False
+
+    def _emit(self, chunk: str) -> None:
+        c = (chunk or "").strip()
+        if not c:
+            return
+        self.emit(c)
+        self.first_chunk_emitted = True
 
     def _limits(self) -> Tuple[int, int]:
         if not self.adaptive:
@@ -1223,14 +1197,26 @@ class StreamChunker:
         """Nimmt neue Textdeltas auf und emittiert ggf. fertige Chunks."""
         if not delta or STOP or CANCEL_TTS.is_set():
             return
+        if self.first_token_ts is None:
+            self.first_token_ts = time.perf_counter()
         self.buf += delta
 
         # 1) harte Trennung bei Zeilenumbrüchen
         while "\n" in self.buf:
             left, right = self.buf.split("\n", 1)
-            if left.strip():
-                self.emit(left.strip())
+            self._emit(left)
             self.buf = right
+
+        # Fast-first: frühes erstes Chunk ohne Satzende
+        if not self.first_chunk_emitted and self.buf.strip():
+            if len(self.buf) >= self.first_min_chars:
+                self._emit(self.buf)
+                self.buf = ""
+                return
+            if self.first_token_ts and (time.perf_counter() - self.first_token_ts) >= self.first_max_wait_sec:
+                self._emit(self.buf)
+                self.buf = ""
+                return
 
         # 2) chunking bei Satzzeichen, sobald min_chars erreicht
         while True:
@@ -1245,21 +1231,19 @@ class StreamChunker:
                 if len(self.buf) > max_chars:
                     sp = cut.rfind(" ")
                     if sp > 0:
-                        self.emit(self.buf[:sp].strip())
+                        self._emit(self.buf[:sp])
                         self.buf = self.buf[sp:].lstrip()
                         continue
                 break
             emit_upto = idx + 1
-            chunk = self.buf[:emit_upto].strip()
-            if chunk:
-                self.emit(chunk)
+            self._emit(self.buf[:emit_upto])
             self.buf = self.buf[emit_upto:].lstrip()
 
     def flush(self):
         """Gibt Restbuffer am Ende aus."""
         tail = self.buf.strip()
         if tail:
-            self.emit(tail)
+            self._emit(tail)
         self.buf = ""
 
 
@@ -1551,6 +1535,8 @@ def main():
     tts_adaptive_chunking = env_bool("MIA_TTS_ADAPTIVE_CHUNKING", True)
     tts_phase1_sec = env_float("MIA_TTS_PHASE1_SEC", 1.2)
     tts_phase2_sec = env_float("MIA_TTS_PHASE2_SEC", 3.5)
+    tts_first_min_chars = env_int("MIA_TTS_FIRST_MIN_CHARS", 25)
+    tts_first_max_wait_sec = env_float("MIA_TTS_FIRST_MAX_WAIT_SEC", 0.8)
 
     tts_intro_enable = env_bool("MIA_TTS_INTRO_ENABLE", True)
     tts_intro_texts_raw = env_str(
@@ -1559,12 +1545,8 @@ def main():
     )
     tts_intro_texts = [x.strip() for x in tts_intro_texts_raw.split(",") if x.strip()]
     tts_intro_cooldown_sec = env_float("MIA_TTS_INTRO_COOLDOWN_SEC", 8.0)
-
-    prefab_enabled = env_bool("MIA_PREFAB_INTRO", True)
-    prefab_dir = Path(env_str("MIA_PREFAB_DIR", "/data/mia/repo_2/data/audio/prefabs"))
-    prefab_prob = max(0.0, min(1.0, env_float("MIA_PREFAB_PROB", 0.7)))
-    prefab_cooldown_sec = env_float("MIA_PREFAB_COOLDOWN_SEC", 8.0)
-    prefab_files = sorted([x for x in prefab_dir.glob("*.wav") if x.is_file()])
+    intro_repeat_sec = env_float("MIA_INTRO_REPEAT_SEC", 2.5)
+    intro_max_repeats = env_int("MIA_INTRO_MAX_REPEATS", 3)
 
     # Echo guard Parameter
     echo_overlap = env_float("MIA_ECHO_OVERLAP", 0.45)
@@ -1608,16 +1590,13 @@ def main():
         debug,
     )
     log(
-        f"TTS intro: enabled={tts_intro_enable} cooldown={tts_intro_cooldown_sec:.1f}s texts={len(tts_intro_texts)}",
+        f"TTS first-chunk: min_chars={tts_first_min_chars} max_wait={tts_first_max_wait_sec:.2f}s",
         debug,
     )
     log(
-        f"Prefab intro: enabled={prefab_enabled} prob={prefab_prob:.2f} cooldown={prefab_cooldown_sec:.1f}s dir={prefab_dir}",
+        f"TTS intro: enabled={tts_intro_enable} cooldown={tts_intro_cooldown_sec:.1f}s texts={len(tts_intro_texts)}",
         debug,
     )
-    log(f"Prefabs loaded: {len(prefab_files)} files", debug)
-    if prefab_enabled and not prefab_files:
-        log(f"WARN: Prefab dir has no wav files: {prefab_dir}", debug)
     log(f"Stopwords: {stopwords}", debug)
     log(f"Echo guard: overlap>={echo_overlap:.2f} history={echo_history} window={echo_window_sec:.2f}s", debug)
 
@@ -1646,7 +1625,6 @@ def main():
     # TTS Manager (Queue + Worker)
     tts_mgr = TTSManager(debug=debug)
     last_intro_ts = 0.0
-    last_prefab_time = 0.0
 
     def _on_barge_hit(_txt: str) -> None:
         CANCEL_TTS.set()
@@ -1830,25 +1808,31 @@ def main():
                 t0_ollama = time.perf_counter()
                 if tts_stream:
                     arm_intro = {"v": True}
-
-                    if prefab_enabled and prefab_files:
-                        now_pf = time.time()
-                        if (now_pf - last_prefab_time) >= prefab_cooldown_sec and random.random() < prefab_prob:
-                            chosen = random.choice(prefab_files)
-                            log(f"Prefab: play {chosen.name}", debug)
-                            play_prefab_wav(chosen, debug)
-                            last_prefab_time = now_pf
+                    real_chunk_emitted = {"v": False}
 
                     if tts_intro_enable and tts_intro_texts and (time.time() - last_intro_ts) >= tts_intro_cooldown_sec:
                         intro = tts_intro_texts[int(time.time()) % len(tts_intro_texts)]
                         tts_mgr.enqueue(intro, turn_id=turn_id)
                         last_intro_ts = time.time()
 
+                        def _intro_repeat_worker() -> None:
+                            sent = 1
+                            while sent < max(1, intro_max_repeats):
+                                time.sleep(max(0.2, intro_repeat_sec))
+                                if STOP or CANCEL_TTS.is_set() or real_chunk_emitted["v"]:
+                                    return
+                                intro2 = tts_intro_texts[(int(time.time()) + sent) % len(tts_intro_texts)]
+                                tts_mgr.enqueue(intro2, turn_id=turn_id)
+                                sent += 1
+
+                        threading.Thread(target=_intro_repeat_worker, daemon=True).start()
+
                     # Wenn ein Chunk fertig ist -> in TTS Queue
                     def emit_chunk(txt: str):
                         nonlocal arm_intro
                         if STOP or CANCEL_TTS.is_set():
                             return
+                        real_chunk_emitted["v"] = True
                         if arm_intro["v"]:
                             arm_intro["v"] = False
                             if debug:
@@ -1863,6 +1847,8 @@ def main():
                         adaptive=tts_adaptive_chunking,
                         phase1_sec=tts_phase1_sec,
                         phase2_sec=tts_phase2_sec,
+                        first_min_chars=tts_first_min_chars,
+                        first_max_wait_sec=tts_first_max_wait_sec,
                     )
 
                     # Bei jedem LLM delta -> chunker.push
@@ -1903,6 +1889,9 @@ def main():
             # Falls LLM leer -> fallback
             assistant = (assistant or "").strip() or "Ich habe gerade keine Antwort. Bitte wiederhole das."
             log(f"Mia: {assistant}", debug)
+
+            if tts_stream and (not real_chunk_emitted["v"]):
+                tts_mgr.enqueue(assistant, turn_id=turn_id)
 
             # Volltext auch in echo history (zusätzlich zu chunk history)
             recent_assistant.append(assistant)

@@ -1796,19 +1796,17 @@ def main():
 
                 t0_ollama = time.perf_counter()
                 if tts_stream:
-                    arm_intro = {"v": True}
                     real_chunk_emitted = {"v": False}
+                    first_chunk_logged = {"v": False}
 
                     # Wenn ein Chunk fertig ist -> in TTS Queue
                     def emit_chunk(txt: str):
-                        nonlocal arm_intro
                         if STOP or CANCEL_TTS.is_set():
                             return
                         real_chunk_emitted["v"] = True
-                        if arm_intro["v"]:
-                            arm_intro["v"] = False
-                            if debug:
-                                log(f"First real chunk emitted at t={time.perf_counter() - t0_ollama:.2f}s", debug)
+                        if debug and not first_chunk_logged["v"]:
+                            first_chunk_logged["v"] = True
+                            log(f"First real chunk emitted at t={time.perf_counter() - t0_ollama:.2f}s", debug)
                         tts_mgr.enqueue(txt, turn_id=turn_id)
                         recent_assistant.append(txt)
 
@@ -1835,7 +1833,6 @@ def main():
                     assistant = ollama_chat_http_stream(
                         ollama_host, model, keepalive, sess["messages"], debug, on_delta=on_delta
                     )
-                    arm_intro["v"] = False
                     # Rest raus
                     chunker.flush()
                 else:

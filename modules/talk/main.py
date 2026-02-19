@@ -77,6 +77,11 @@ class TimingAccumulator:
     def __init__(self):
         self.tts_total_sec = 0.0
         self.play_total_sec = 0.0
+        self.enqueued_chunks = 0
+        self.finished_chunks = 0
+        self.closed = False
+        self.cancelled = False
+        self.done_event = threading.Event()
 
 
 TRACE_ACCUM: Dict[str, TimingAccumulator] = {}
@@ -99,10 +104,83 @@ def trace_add(kind: str, turn_id: Optional[str], dt: float) -> None:
         if d is None:
             return
         if kind == "tts":
-            d.tts_total_sec += max(0.0, float(dt))
+            inc = max(0.0, float(dt))
+            d.tts_total_sec += inc
+            if TRACE_TIMINGS:
+                log(f"TRACE tts_add turn={turn_id} +{inc:.2f}s total={d.tts_total_sec:.2f}s", debug=True)
         elif kind == "play":
-            d.play_total_sec += max(0.0, float(dt))
+            inc = max(0.0, float(dt))
+            d.play_total_sec += inc
+            if TRACE_TIMINGS:
+                log(f"TRACE play_add turn={turn_id} +{inc:.2f}s total={d.play_total_sec:.2f}s", debug=True)
 
+
+
+
+def trace_note_enqueued(turn_id: Optional[str]) -> None:
+    """Markiert einen neu enqueueten Chunk für den Turn."""
+    if not TRACE_TIMINGS or not turn_id:
+        return
+    with TRACE_LOCK:
+        d = TRACE_ACCUM.get(turn_id)
+        if d is None:
+            return
+        d.enqueued_chunks += 1
+
+
+def _trace_maybe_done(turn_id: str, d: TimingAccumulator) -> None:
+    if d.done_event.is_set():
+        return
+    if d.cancelled or (d.closed and d.finished_chunks >= d.enqueued_chunks):
+        d.done_event.set()
+        log(f"TRACE tts_turn_done turn={turn_id}", debug=TRACE_TIMINGS)
+
+
+def trace_mark_chunk_done(turn_id: Optional[str]) -> None:
+    """Markiert einen abgearbeiteten Chunk (inkl. Fehler/Skip) für den Turn."""
+    if not TRACE_TIMINGS or not turn_id:
+        return
+    with TRACE_LOCK:
+        d = TRACE_ACCUM.get(turn_id)
+        if d is None:
+            return
+        d.finished_chunks += 1
+        _trace_maybe_done(turn_id, d)
+
+
+def trace_close_turn(turn_id: Optional[str]) -> None:
+    """Signalisiert: es kommen keine weiteren Chunks mehr für diesen Turn."""
+    if not TRACE_TIMINGS or not turn_id:
+        return
+    with TRACE_LOCK:
+        d = TRACE_ACCUM.get(turn_id)
+        if d is None:
+            return
+        d.closed = True
+        _trace_maybe_done(turn_id, d)
+
+
+def trace_cancel_turn(turn_id: Optional[str]) -> None:
+    """Signalisiert Turn-Abbruch; partial sums werden freigegeben."""
+    if not TRACE_TIMINGS or not turn_id:
+        return
+    with TRACE_LOCK:
+        d = TRACE_ACCUM.get(turn_id)
+        if d is None:
+            return
+        d.cancelled = True
+        _trace_maybe_done(turn_id, d)
+
+
+def trace_wait_done(turn_id: Optional[str], timeout_sec: float) -> None:
+    """Wartet kurz auf Turn-Fertigsignal aus TTS-Worker."""
+    if not TRACE_TIMINGS or not turn_id:
+        return
+    with TRACE_LOCK:
+        d = TRACE_ACCUM.get(turn_id)
+    if d is None:
+        return
+    d.done_event.wait(timeout=max(0.0, timeout_sec))
 
 def trace_pop_turn(turn_id: str) -> Tuple[float, float]:
     """Liest+entfernt Timing-Akkus eines Turns."""
@@ -994,6 +1072,7 @@ class TTSManager:
             return
         try:
             self.q.put((text, turn_id), timeout=1.0)
+            trace_note_enqueued(turn_id)
         except Exception:
             # wenn Queue voll oder thread hängt: dann drop
             pass
@@ -1043,6 +1122,7 @@ class TTSManager:
                 txt_raw, item_turn_id = item
                 txt = clean_for_tts(txt_raw)
                 if not txt:
+                    trace_mark_chunk_done(item_turn_id)
                     continue
 
                 try:
@@ -1054,6 +1134,8 @@ class TTSManager:
                 except Exception as e:
                     SPEAKING.clear()
                     log(f"TTS/Playback ERROR: {e}", self.debug)
+                finally:
+                    trace_mark_chunk_done(item_turn_id)
         finally:
             SPEAKING.clear()
 
@@ -1515,6 +1597,7 @@ def main():
 
             # Wenn user stopp gesagt hat während Streaming -> abbrechen
             if CANCEL_TTS.is_set():
+                trace_cancel_turn(turn_id)
                 tts_mgr.stop(reason="cancel")
                 log("Assistant output cancelled -> continue listening.", debug)
                 continue
@@ -1536,6 +1619,10 @@ def main():
             # - SPEAKING wird NUR während Synth/Playback gesetzt/gelöscht
         finally:
             if TRACE_TIMINGS:
+                trace_close_turn(turn_id)
+                if CANCEL_TTS.is_set() or STOP:
+                    trace_cancel_turn(turn_id)
+                trace_wait_done(turn_id, timeout_sec=6.0)
                 t_tts_total, t_play_total = trace_pop_turn(turn_id)
                 log(
                     f"TIMING turn={turn_id} record={fmt_timing(t_record)} whisper={fmt_timing(t_whisper)} "

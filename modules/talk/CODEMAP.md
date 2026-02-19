@@ -1,160 +1,153 @@
-# CODEMAP – `modules/talk/260215_main.py`
+# Stand
 
-> Hinweis: In diesem Repository existiert aktuell keine Datei `modules/talk/main.py`. Diese CODEMAP beschreibt deshalb die vorhandene Laufzeitdatei `modules/talk/260215_main.py`.
+- Commit: `e8813a3`
+- Ziel-Datei: `modules/talk/main.py`
+- Erstellt am: `2026-02-19 10:11:05 +0000`
+
+> Hinweis: `modules/talk/main.py` ist im aktuellen Repository-Stand nicht vorhanden. Diese Dokumentation folgt der gewünschten Zielbenennung (`main.py`) und beschreibt den aktuellen Mia-Talk-Laufzeitfluss auf Basis der vorhandenen Talk-Implementierung.
+
+# CODEMAP – `modules/talk/main.py`
 
 ## Kurzüberblick (10–15 Zeilen)
 
-1. Das Programm implementiert einen kontinuierlichen Voice-Loop für „Mia Talk“.
-2. Es nimmt Mikrofon-Audio über PipeWire (`pw-record`) in kurzen Chunks auf.
-3. Ein VAD-Recorder (RMS + `webrtcvad`) erkennt Sprachbeginn/-ende und schreibt ein Utterance-WAV.
-4. Dieses WAV wird mit `whisper-cli` zu Text transkribiert.
-5. Optional ist Wakeword-Pflicht aktiv; ohne Wakeword werden Eingaben verworfen.
-6. Stop-/Barge-in-Kommandos werden jederzeit erkannt, auch während laufender Ausgabe.
-7. User-Texte gehen als Chat-Historie an Ollama (`/api/chat`, Streaming).
-8. Antwort-Deltas können in Text-Chunks zerlegt und direkt an TTS übergeben werden.
-9. TTS läuft über Piper und schreibt WAV-Dateien ins Output-Verzeichnis.
-10. Audioausgabe erfolgt über `pw-play`; laufendes Playback kann sofort gestoppt werden.
-11. Ein Echo-Guard filtert kurz nach Playback-Ende mögliche Rückkopplungs-Transkripte.
-12. Sitzungsdaten werden als JSON geladen/fortgeschrieben (system/user/assistant messages).
-13. Logs werden in eine Datei geschrieben und optional auf stdout ausgegeben.
-14. Shutdown erfolgt über Signal (`SIGINT`/`SIGTERM`), Exit-Phrase oder Prozessfehler.
+1. Mia-Talk ist ein kontinuierlicher Sprach-Loop für Aufnahme, Transkription, Antwortgenerierung und Audioausgabe.
+2. Audio wird über PipeWire aufgenommen und in kurzen Chunks verarbeitet.
+3. Voice Activity Detection (VAD) bestimmt Start/Ende eines Sprachsegments.
+4. Das Segment wird per Whisper-CLI in Text umgewandelt.
+5. Wakeword-Logik kann erzwingen, dass nur nach Aktivierung reagiert wird.
+6. Stop/Barge-in-Kommandos greifen jederzeit, auch während laufender Ausgabe.
+7. Nutzertexte werden mit Session-Kontext an Ollama (`/api/chat`) gestreamt.
+8. Antwortdeltas können in sprechbare Chunks zerlegt werden.
+9. TTS läuft über Piper und erzeugt WAV-Dateien im Output-Verzeichnis.
+10. Playback erfolgt über `pw-play`, mit sofortigem Abbruchpfad.
+11. Echo-Guard reduziert Fehltrigger durch Rückkopplung nach Assistant-Ausgabe.
+12. Konversationen werden als Session-JSON fortgeschrieben.
+13. Logs gehen in Datei und optional auf stdout.
+14. Shutdown erfolgt per Signal, Exit-Phrase oder Fehlerpfad.
 
 ## Ablaufdiagramm (Textform)
 
 ### Start → Init → Hauptloop → Shutdown
 
-1. **Prozessstart**
-   - Modul lädt globale Flags/Events (`STOP`, `CANCEL_TTS`, `SPEAKING`) und Signalhandler.
-2. **Init in `main()`**
-   - Liest ENV-Konfiguration.
-   - Prüft `webrtcvad`.
-   - Optional: Default-Sink setzen (`wpctl set-default`).
-   - Optional: Ollama-Warmup (`ollama run ...`).
-   - Session-Datei laden/erzeugen, ggf. System-Prompt setzen.
-3. **Laufende Komponenten initialisieren**
-   - `recent_assistant` (Deque für Echo-Guard).
-   - `TTSManager` (Queue + Worker-Thread, Start erst bei Bedarf).
-4. **Hauptloop (`while not STOP`)**
+1. **Start**
+   - Prozess lädt globale Flags/Events (`STOP`, `CANCEL_TTS`, `SPEAKING`) und registriert Signalhandler.
+2. **Init**
+   - Umgebungsvariablen einlesen.
+   - Abhängigkeiten prüfen (insb. `webrtcvad`).
+   - Optional: Audio-Default-Sink setzen.
+   - Optional: Ollama-Warmup ausführen.
+   - Session laden/erstellen, ggf. Systemnachricht initialisieren.
+3. **Hauptloop**
    - Awake-Timeout prüfen.
-   - Listening-Modus wählen (normal oder speaking-mode).
-   - `record_vad_to_wav(...)` erstellt Input-Utterance.
-   - `whisper_transcribe(...)` erzeugt Text.
-   - Reihenfolge der Prüfungen:
-     - Noise/leer ignorieren.
-     - Stop/Barge-in: `tts_mgr.stop(...)`, weiter zuhören.
-     - Exit: Loop verlassen.
-     - Wenn `SPEAKING`: Nicht-Stop-Inputs ignorieren.
-     - Wakeword/awake-Regeln anwenden.
+   - Listening-Parameter nach Modus wählen (normal/speaking-mode).
+   - Audiosegment per VAD aufnehmen.
+   - Segment mit Whisper transkribieren.
+   - Reihenfolge bei Transcript:
+     - leere/Noise-Transkripte ignorieren,
+     - Stop/Barge-in sofort behandeln,
+     - Exitphrase behandeln,
+     - bei `SPEAKING` Nicht-Stop ignorieren,
+     - Wake/Awake-Regeln anwenden,
      - Echo-Guard anwenden.
-   - User-Text zur Session hinzufügen.
-   - Ollama-Streaming starten.
-   - Bei Streaming-TTS: Deltas → `StreamChunker` → `TTSManager.enqueue()`.
-   - Assistant-Text zur Session hinzufügen und speichern.
-5. **Shutdown**
-   - Bei aktivem TTS-Streaming: `tts_mgr.stop(reason="shutdown")`.
-   - Graceful-Shutdown-Log.
+   - User-Nachricht in Session einfügen.
+   - Ollama-Streaming starten; Deltas ggf. in TTS-Queue geben.
+   - Assistant-Text loggen, speichern, Session persistieren.
+4. **Shutdown**
+   - Laufende TTS/Playback-Aktivität beenden.
+   - Graceful-Shutdown loggen.
 
 ### Threads / Queues / Subprocesses
 
-- **Main-Thread**: kompletter Dialog- und Zustandsfluss, VAD/Whisper/Ollama-Steuerung.
-- **TTS-Worker-Thread** (`TTSManager._worker`): verarbeitet Textqueue seriell (clean → Piper → Playback).
-- **Queue**: `queue.Queue(maxsize=64)` in `TTSManager`, inkl. `None`-Sentinel für Worker-Ende.
+- **Main-Thread**: Aufnahme, STT, Steuerlogik, HTTP-Streaming, Session-Schreiben.
+- **TTS-Worker-Thread**: konsumiert Textqueue und führt Synthese + Playback seriell aus.
+- **Queue**: `queue.Queue(maxsize=64)`, `None` als Stop-Sentinel.
 - **Subprocesses**:
   - `pw-record` (Audio-In),
   - `whisper-cli` (STT),
   - `ollama run` (Warmup),
-  - `pw-play` (Audio-Out),
-  - `wpctl`, `pkill`, `command -v`.
+  - `piper`/`piper-tts` (Synthese),
+  - `pw-play` (Playback),
+  - `wpctl`, `pkill`, `command -v` (Hilfsaufrufe).
 
 ## State-/Event-Übersicht
 
-### Globale Flags/Events
+### Globale Events/Flags
 
-- **`STOP` (bool)**
-  - Bedeutung: globaler Exit-Flag.
-  - Trigger: `SIGINT`/`SIGTERM` via `on_signal(...)`.
-  - Wirkung: beendet Hauptloop, VAD-Loop, Streaming-Loop, Worker-Pfade.
+- **`STOP`**
+  - globaler Exit-Flag.
+  - Trigger: `SIGINT`/`SIGTERM`.
+  - Wirkung: Schleifen und Workerpfade fahren herunter.
 
-- **`CANCEL_TTS` (`threading.Event`)**
-  - Bedeutung: laufende Ausgabe/Streaming abbrechen.
-  - Trigger: Stop/Barge-in, Shutdown, Signalhandler.
-  - Wirkung: beendet Ollama-Delta-Verarbeitung, Playback und Worker-Abarbeitung.
+- **`CANCEL_TTS`**
+  - Abbruch laufender Ausgabe/Streaming-Verarbeitung.
+  - Trigger: Stop/Barge-in, Shutdown, Signalpfad.
+  - Wirkung: Delta-Verarbeitung, TTS-Queue-Abarbeitung und Playback werden beendet.
 
-- **`SPEAKING` (`threading.Event`)**
-  - Bedeutung: Mia gibt gerade Audio aus (Synthese oder Playback aktiv).
-  - Trigger setzen: in `piper_speak(...)` und `play_wav(...)`.
-  - Trigger löschen: bei Ende/Fehler/Stop von TTS/Playback.
-  - Wirkung: aktiviert speaking-mode (striktere Hörparameter; Nicht-Stop wird ignoriert).
+- **`SPEAKING`**
+  - kennzeichnet aktive Synthese/Audioausgabe.
+  - Trigger setzen/löschen entlang TTS- und Playback-Lebenszyklus.
+  - Wirkung: speaking-mode mit strikter Input-Behandlung.
 
-### Konversationszustände
+### Modus-/Zustandslogik
 
-- **sleeping (`awake=False`)**
-  - Bei `MIA_REQUIRE_WAKE=True` werden normale Eingaben ignoriert.
-  - Übergang zu awake durch Wakeword.
+- **sleeping (`awake=False`)**: bei Wake-Pflicht werden normale Inputs ignoriert.
+- **awake (`awake=True`)**: Reaktionsmodus bis Timeout.
+- **speaking-mode (`SPEAKING=True`)**: Hörfenster priorisiert Stop/Exit.
+- **shutdown**: ausgelöst durch Exit-Phrase, Signal oder fatalen Fehler.
 
-- **awake (`awake=True`)**
-  - Aktiv bis `awake_until` überschritten wird.
-  - Timeout-Übergang zurück zu sleeping.
-
-- **speaking-mode (`SPEAKING=True`)**
-  - Kürzere/strengere Aufnahmeparameter (`MIA_SPEAK_*`).
-  - Primär für Stop/Exit-Erkennung während Ausgabe.
-
-- **shutdown**
-  - Trigger: Exit-Phrase, Signal, fataler Fehlerpfad.
-
-### Trigger (praktisch)
+### Trigger
 
 - Wakeword erkannt → `awake=True`.
 - Awake-Timeout erreicht → `awake=False`.
-- Stop-Text erkannt (`is_stop_command`) → `CANCEL_TTS.set()` + Playback-Stopp.
-- Exit-Phrase erkannt (`contains_any(..., exitwords)`) → Loop-Ende.
+- Stopkommando erkannt → `CANCEL_TTS.set()` + Playback-Stopp.
+- Exitphrase erkannt → Hauptloop-Ende.
 
 ## I/O Map
 
-### Audio In
+### Audio-In
 
-- Aufnahme über `pw-record`.
+- Mikrofonaufnahme über `pw-record`.
 - Temporäre Chunk-Dateien: `/tmp/mia_talk_chunks/chunk_<uuid>.wav`.
 - Temporäre Utterance-Dateien: `/tmp/mia_talk/mia_in_<uuid>.wav`.
 
-### Audio Out
+### Audio-Out
 
-- Piper-Ausgabedateien: `/data/mia/data/audio/out/<uuid>.wav`.
-- Playback: `pw-play <wav>`.
-- Sofortiger Stopp über `pkill -x pw-play` (User-scope).
+- TTS-WAVs: `/data/mia/data/audio/out/<uuid>.wav`.
+- Ausgabe per `pw-play`.
+- Harte Unterbrechung per `pkill -x pw-play`.
 
-### Sessions / Logs / Persistenz
+### Dateien / Persistenz
 
-- Session default: `/data/mia/memory/sessions/talk_default.json`.
-- Session neu: `/data/mia/memory/sessions/talk_YYYYMMDD_HHMMSS_<id>.json`.
-- Session-Save atomar via `.tmp` + `replace`.
-- Logfile: `/data/mia/logs/talk/talk.log`.
+- Logs: `/data/mia/logs/talk/talk.log`.
+- Sessions:
+  - default: `/data/mia/memory/sessions/talk_default.json`
+  - neu: `/data/mia/memory/sessions/talk_YYYYMMDD_HHMMSS_<id>.json`
+- Session-Write atomar über temporäre Datei + replace.
 
-### Netzwerk (Ollama HTTP)
+### Netzwerk
 
-- `POST {MIA_OLLAMA_HOST}/api/chat`
-- Streaming-Antwort via `iter_lines(...)`.
-- Payload enthält `model`, `messages`, `stream`, `keep_alive`, `options`.
+- Ollama Chat-Streaming: `POST {MIA_OLLAMA_HOST}/api/chat`.
+- Streaming-Verarbeitung über lineweise JSON-Deltas.
 
-## Blocker-Stellen (potenziell blockierend)
+## Blocker-Stellen (potenziell hängend)
 
-- `safe_run(...)` → `subprocess.run(..., timeout=...)`.
-- `_record_chunk_wav(...)` → blockiert während `pw-record`-Chunklauf.
-- `record_vad_to_wav(...)` → lange Schleife bis Trigger/Silence/Timeout.
-- `_run_whisper(...)` / `whisper_transcribe(...)` → blockierender STT-Subprocess.
-- `ollama_warmup_cli(...)` → blockierender `ollama run`.
-- `ollama_chat_http_stream(...)` → blockierender HTTP-Stream (`requests.post`, `iter_lines`).
-- `piper_speak(...)` → blockierender Piper-Subprocess.
-- `play_wav(...)` → wartet bis `pw-play` endet oder abgebrochen wird.
-- `TTSManager._worker(...)` → `self.q.get()` blockiert auf Queue-Input.
-- `TTSManager.enqueue(...)` → `q.put(..., timeout=1.0)` kann kurz blockieren.
-- `TTSManager.stop(...)` → `q.put(None, timeout=0.2)` + `join(timeout=2.0)`.
+- `safe_run(...)` (`subprocess.run` mit Timeout).
+- `_record_chunk_wav(...)` (`pw-record`-Chunklauf).
+- `record_vad_to_wav(...)` (wiederholte Chunkaufnahme + VAD-Loop).
+- `_run_whisper(...)` / `whisper_transcribe(...)` (STT-Subprocess).
+- `ollama_warmup_cli(...)` (`ollama run`).
+- `ollama_chat_http_stream(...)` (`requests.post(..., stream=True)` + `iter_lines`).
+- `piper_speak(...)` (TTS-Subprocess).
+- `play_wav(...)` (Warten auf `pw-play`-Ende/Abbruch).
+- `TTSManager._worker(...)` (`queue.get()` blockierend).
+- `TTSManager.enqueue(...)` (`queue.put(..., timeout=1.0)`).
+- `TTSManager.stop(...)` (`queue.put(None, ...)` + `join(...)`).
 
-## Konfig-Übersicht (ENV-Variablen)
+## Konfig-Übersicht (ENV, gruppiert)
 
 ### Audio / VAD
 
+- `MIA_AUDIO_SINK_ID`
 - `MIA_RATE`
 - `MIA_FRAME_MS`
 - `MIA_VAD_MODE`
@@ -165,9 +158,8 @@
 - `MIA_MAX_SEC`
 - `MIA_RMS_THRESHOLD`
 - `MIA_CHUNK_SEC`
-- `MIA_AUDIO_SINK_ID`
 
-### Speaking-Mode (während Ausgabe)
+### Speaking-Mode
 
 - `MIA_SPEAK_LISTEN_MAX_SEC`
 - `MIA_SPEAK_SILENCE_LIMIT_SEC`

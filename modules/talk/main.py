@@ -649,22 +649,17 @@ def record_vad_to_wav(
     max_sec: int,
     rms_threshold: int,
     debug: bool,
+    start_trigger_ratio: Optional[float] = None,
+    start_ring_ms: Optional[int] = None,
+    start_rms_threshold: Optional[int] = None,
+    end_silence_limit_sec: Optional[float] = None,
+    end_rms_threshold: Optional[int] = None,
+    chunk_sec_pre: Optional[float] = None,
+    chunk_sec_post: Optional[float] = None,
+    max_leadin_sec: Optional[float] = None,
 ) -> bool:
     """
-    Haupt-VAD Recorder:
-
-    Ablauf:
-    - Nimmt wiederholt kurze Chunks (z.B. 0.40s) auf
-    - Zerlegt in Frames (frame_ms, z.B. 30ms)
-    - Pro Frame:
-        - RMS prüfen (Lautstärke)
-        - wenn laut genug -> webrtcvad.is_speech
-    - Ringbuffer (ring_ms) sammelt Frames vor Trigger:
-        - wenn Anteil speech >= trigger_ratio -> "speech start"
-    - Ab Trigger:
-        - Frames sammeln bis silence länger als silence_limit_sec -> "speech end"
-    - Wenn Aufnahme < min_speech_sec -> ignorieren
-    - Schreibt am Ende output_wav (mono, 16kHz, PCM16)
+    Haupt-VAD Recorder mit Fast-Start/Safe-End Tuning.
     """
     import webrtcvad  # type: ignore
 
@@ -681,8 +676,18 @@ def record_vad_to_wav(
     # Bytes pro Frame (PCM16 -> 2 bytes pro sample)
     frame_size_bytes = int(rate * frame_ms / 1000) * 2
 
-    # Ringbuffer Länge in Frames
-    ring_maxlen = max(1, int(ring_ms / frame_ms))
+    # Fast-start / safe-end Parameter (mit Fallback auf bestehende Werte)
+    _start_trigger_ratio = float(start_trigger_ratio if start_trigger_ratio is not None else trigger_ratio)
+    _start_ring_ms = int(start_ring_ms if start_ring_ms is not None else ring_ms)
+    _start_rms_threshold = int(start_rms_threshold if start_rms_threshold is not None else rms_threshold)
+    _end_silence_limit_sec = float(end_silence_limit_sec if end_silence_limit_sec is not None else silence_limit_sec)
+    _end_rms_threshold = int(end_rms_threshold if end_rms_threshold is not None else rms_threshold)
+    _chunk_sec_pre = float(chunk_sec_pre if chunk_sec_pre is not None else env_float("MIA_CHUNK_SEC_PRE", env_float("MIA_CHUNK_SEC", 0.40)))
+    _chunk_sec_post = float(chunk_sec_post if chunk_sec_post is not None else env_float("MIA_CHUNK_SEC_POST", 0.45))
+    _max_leadin_sec = float(max_leadin_sec if max_leadin_sec is not None else 3.0)
+
+    # Ringbuffer Länge in Frames (vor Trigger)
+    ring_maxlen = max(1, int(_start_ring_ms / frame_ms))
     ring_buffer = collections.deque(maxlen=ring_maxlen)
 
     frames: List[bytes] = []
@@ -690,13 +695,20 @@ def record_vad_to_wav(
     silence_counter = 0
 
     t0 = time.time()
-
-    # Chunk-Länge für pw-record (kann über Env angepasst werden)
-    chunk_sec = float(env_float("MIA_CHUNK_SEC", 0.40))
+    lead_in_start = time.time()
 
     # Temporäre Chunk-Dateien
     tmp_dir = Path("/tmp/mia_talk_chunks")
     ensure_dir(tmp_dir)
+
+    if debug:
+        log(
+            f"VAD tune: chunk_pre={_chunk_sec_pre:.2f}s chunk_post={_chunk_sec_post:.2f}s "
+            f"start_ring_ms={_start_ring_ms} start_trigger_ratio={_start_trigger_ratio:.2f} "
+            f"start_rms={_start_rms_threshold} end_rms={_end_rms_threshold} "
+            f"end_silence={_end_silence_limit_sec:.2f}s max_leadin={_max_leadin_sec:.2f}s",
+            debug,
+        )
 
     while not STOP:
         # Globale max_sec: schützt gegen "ewig warten"
@@ -705,8 +717,15 @@ def record_vad_to_wav(
                 log("VAD: max_sec reached", debug)
             break
 
+        # Lead-in Begrenzung: wenn kein Trigger -> schnell neu lauschen
+        if (not triggered) and ((time.time() - lead_in_start) > _max_leadin_sec):
+            if debug:
+                log("VAD: lead-in timeout (no trigger) -> restart listen", debug)
+            return False
+
+        cur_chunk_sec = _chunk_sec_post if triggered else _chunk_sec_pre
         tmp_wav = tmp_dir / f"chunk_{uuid.uuid4().hex}.wav"
-        ok = _record_chunk_wav(tmp_wav, rate=rate, seconds=chunk_sec, debug=debug)
+        ok = _record_chunk_wav(tmp_wav, rate=rate, seconds=cur_chunk_sec, debug=debug)
         if not ok:
             time.sleep(0.05)
             continue
@@ -724,9 +743,10 @@ def record_vad_to_wav(
             chunk = pcm[idx: idx + frame_size_bytes]
             idx += frame_size_bytes
 
-            # RMS: verhindert VAD false positives bei sehr leisen Signalen
+            # RMS Gate mit separaten Schwellen vor/nach Trigger
             rms = audioop.rms(chunk, 2)
-            if rms < rms_threshold:
+            cur_rms_threshold = _end_rms_threshold if triggered else _start_rms_threshold
+            if rms < cur_rms_threshold:
                 is_speech = False
             else:
                 is_speech = vad.is_speech(chunk, rate)
@@ -737,7 +757,7 @@ def record_vad_to_wav(
                 num_voiced = sum(1 for _, sp in ring_buffer if sp)
 
                 # wenn genug voiced frames -> trigger
-                if num_voiced >= trigger_ratio * ring_buffer.maxlen:
+                if num_voiced >= _start_trigger_ratio * ring_buffer.maxlen:
                     triggered = True
                     frames.extend([c for c, _ in ring_buffer])  # pre-roll übernehmen
                     ring_buffer.clear()
@@ -753,7 +773,7 @@ def record_vad_to_wav(
                     silence_counter = 0
 
                 # genug Stille -> Ende
-                if (silence_counter * frame_ms / 1000.0) > silence_limit_sec:
+                if (silence_counter * frame_ms / 1000.0) > _end_silence_limit_sec:
                     if debug:
                         log("VAD: speech end (silence)", debug)
                     idx = len(pcm)
@@ -764,7 +784,7 @@ def record_vad_to_wav(
             continue
 
         # Wenn getriggert und Silence überschritten -> raus
-        if triggered and (silence_counter * frame_ms / 1000.0) > silence_limit_sec:
+        if triggered and (silence_counter * frame_ms / 1000.0) > _end_silence_limit_sec:
             break
 
     if not frames:
@@ -1612,6 +1632,15 @@ def main():
     max_sec = env_int("MIA_MAX_SEC", 15)
     rms_threshold = env_int("MIA_RMS_THRESHOLD", 420)
 
+    vad_start_trigger_ratio = env_float("MIA_VAD_START_TRIGGER_RATIO", 0.45)
+    vad_start_ring_ms = env_int("MIA_VAD_START_RING_MS", 120)
+    vad_start_rms_threshold = env_int("MIA_VAD_START_RMS_THRESHOLD", 350)
+    vad_end_silence_limit_sec = env_float("MIA_VAD_END_SILENCE_LIMIT_SEC", silence_limit)
+    vad_end_rms_threshold = env_int("MIA_VAD_END_RMS_THRESHOLD", rms_threshold)
+    chunk_sec_pre = env_float("MIA_CHUNK_SEC_PRE", 0.22)
+    chunk_sec_post = env_float("MIA_CHUNK_SEC_POST", 0.45)
+    max_leadin_sec = env_float("MIA_MAX_LEADIN_SEC", 3.0)
+
     # Wake/Exit
     require_wake = env_bool("MIA_REQUIRE_WAKE", True)
     wakewords = env_str("MIA_WAKEWORDS", "hey mia,mia")
@@ -1683,6 +1712,13 @@ def main():
     )
     log(f"Stopwords: {stopwords}", debug)
     log(f"Echo guard: overlap>={echo_overlap:.2f} history={echo_history} window={echo_window_sec:.2f}s", debug)
+    log(
+        f"VAD fast-start/safe-end: chunk_pre={chunk_sec_pre:.2f}s chunk_post={chunk_sec_post:.2f}s "
+        f"start_ring={vad_start_ring_ms} start_ratio={vad_start_trigger_ratio:.2f} "
+        f"start_rms={vad_start_rms_threshold} end_rms={vad_end_rms_threshold} "
+        f"end_silence={vad_end_silence_limit_sec:.2f}s max_leadin={max_leadin_sec:.2f}s",
+        debug,
+    )
 
     # Warmup
     if warmup:
@@ -1791,6 +1827,14 @@ def main():
             max_sec=max_sec,
             rms_threshold=rms_threshold,
             debug=debug,
+            start_trigger_ratio=vad_start_trigger_ratio,
+            start_ring_ms=vad_start_ring_ms,
+            start_rms_threshold=vad_start_rms_threshold,
+            end_silence_limit_sec=vad_end_silence_limit_sec,
+            end_rms_threshold=vad_end_rms_threshold,
+            chunk_sec_pre=chunk_sec_pre,
+            chunk_sec_post=chunk_sec_post,
+            max_leadin_sec=max_leadin_sec,
         )
         t_record = time.perf_counter() - t0_record
         if STOP:

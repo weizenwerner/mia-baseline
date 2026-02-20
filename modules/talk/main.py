@@ -1694,10 +1694,28 @@ def main():
     # Echo-Historie der Assistant-Ausgaben
     recent_assistant: Deque[str] = deque(maxlen=max(1, echo_history))
 
+    # Minimal-State-Machine
+    state = "IDLE"  # IDLE, LISTENING, RESPONDING, CANCELLED, AWAIT_CONFIRMATION
+    last_user_text = ""
+    last_assistant_full = ""
+    last_cancelled_assistant_partial = ""
+    last_turn_was_cancelled = False
+
+    def set_state(new_state: str) -> None:
+        nonlocal state
+        if state != new_state:
+            if debug:
+                log(f"STATE: {state} -> {new_state}", debug)
+            state = new_state
+
     # TTS Manager (Queue + Worker)
     tts_mgr = TTSManager(debug=debug)
 
     def _on_barge_hit(_txt: str) -> None:
+        nonlocal last_turn_was_cancelled, last_cancelled_assistant_partial
+        set_state("CANCELLED")
+        last_turn_was_cancelled = True
+        last_cancelled_assistant_partial = ""
         request_stop_output(tts_mgr, reason="barge", debug=debug)
 
     barge_mon = BargeInMonitor(
@@ -1742,6 +1760,8 @@ def main():
         # Aufnahme-Dateiname
         utt_id = str(uuid.uuid4())
         in_wav = tmp_dir / f"mia_in_{utt_id}.wav"
+
+        set_state("LISTENING")
 
         # Audio aufnehmen bis VAD "speech segment" erkannt hat
         t0_record = time.perf_counter()
@@ -1810,12 +1830,19 @@ def main():
                 if debug:
                     log(f"Barge-in: stop erkannt -> '{t}'", debug)
                     log("Barge-in: cancel requested (stop)", debug)
+                set_state("CANCELLED")
+                last_turn_was_cancelled = True
+                last_cancelled_assistant_partial = ""
                 request_stop_output(tts_mgr, reason="stop", debug=debug)
                 log("Assistant output cancelled -> continue listening.", debug)
                 continue
 
-            # Exit
+            # Exit nur wenn nicht im Antwort-/Sprechmodus
             if contains_any(t, exitwords):
+                if state == "RESPONDING" or SPEAKING.is_set() or is_audio_output_active():
+                    if debug:
+                        log("Exit ignored while speaking/responding", debug)
+                    continue
                 log(f"Exit erkannt: '{t}' -> shutdown.", debug)
                 break
 
@@ -1843,6 +1870,24 @@ def main():
             if not user_text:
                 continue
 
+            user_text_norm = norm_text(user_text)
+            if user_text_norm in {"ja", "nein"} and state != "AWAIT_CONFIRMATION":
+                if debug:
+                    log(f"Ignored standalone confirmation outside confirmation state: '{user_text}'", debug)
+                continue
+
+            if user_text_norm in {"weiter", "bitte weiter", "mach weiter"}:
+                if state == "CANCELLED" or last_turn_was_cancelled:
+                    user_text = "Bitte fahre genau dort fort, wo du aufgehört hast. Wiederhole NICHT den Anfang. Mach weiter."
+                    user_text_norm = norm_text(user_text)
+                    last_turn_was_cancelled = False
+                    if debug:
+                        log("Continue command accepted after cancel -> forcing continuation prompt.", debug)
+                else:
+                    if debug:
+                        log(f"Continue ignored without cancelled context: '{user_text}'", debug)
+                    continue
+
             # Echo-Guard nur kurz nach Playback-Ende:
             # Wenn user_text stark mit recent_assistant überlappt, ist es vermutlich Mia's Echo.
             echo_recent = (time.time() - LAST_PLAY_END_TS) < echo_window_sec
@@ -1851,6 +1896,7 @@ def main():
                     log(f"Echo-guard -> ignored: '{user_text}'", debug)
                 continue
 
+            last_user_text = user_text
             log(f"Du: {user_text}", debug)
             sess["messages"].append({"role": "user", "content": user_text})
 
@@ -1862,6 +1908,7 @@ def main():
                 CANCEL_TTS.clear()
 
             assistant = ""
+            set_state("RESPONDING")
             try:
                 if requests is None:
                     raise RuntimeError("requests missing -> install requests in venv")
@@ -1929,6 +1976,9 @@ def main():
 
             # Wenn user stopp gesagt hat während Streaming -> abbrechen
             if CANCEL_TTS.is_set():
+                set_state("CANCELLED")
+                last_turn_was_cancelled = True
+                last_cancelled_assistant_partial = assistant or ""
                 trace_cancel_turn(turn_id)
                 request_stop_output(tts_mgr, reason="cancel", debug=debug)
                 log("Assistant output cancelled -> continue listening.", debug)
@@ -1947,6 +1997,10 @@ def main():
             # Session speichern
             sess["messages"].append({"role": "assistant", "content": assistant})
             save_session(sess_path, sess)
+            last_assistant_full = assistant
+            last_cancelled_assistant_partial = ""
+            last_turn_was_cancelled = False
+            set_state("IDLE")
 
             # WICHTIG:
             # Kein tts_mgr.finish()!

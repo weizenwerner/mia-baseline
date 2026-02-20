@@ -642,6 +642,11 @@ def record_vad_to_wav(
     start_rms_threshold: Optional[int] = None,
     end_silence_limit_sec: Optional[float] = None,
     end_rms_threshold: Optional[int] = None,
+    end_rms_soft: Optional[int] = None,
+    end_silence_soft_sec: Optional[float] = None,
+    end_rms_hard: Optional[int] = None,
+    end_silence_hard_sec: Optional[float] = None,
+    max_record_seconds: Optional[float] = None,
     chunk_sec_pre: Optional[float] = None,
     chunk_sec_post: Optional[float] = None,
     max_leadin_sec: Optional[float] = None,
@@ -670,6 +675,11 @@ def record_vad_to_wav(
     _start_rms_threshold = int(start_rms_threshold if start_rms_threshold is not None else rms_threshold)
     _end_silence_limit_sec = float(end_silence_limit_sec if end_silence_limit_sec is not None else silence_limit_sec)
     _end_rms_threshold = int(end_rms_threshold if end_rms_threshold is not None else rms_threshold)
+    _end_rms_soft = int(end_rms_soft if end_rms_soft is not None else 480)
+    _end_silence_soft_sec = float(end_silence_soft_sec if end_silence_soft_sec is not None else 0.45)
+    _end_rms_hard = int(end_rms_hard if end_rms_hard is not None else _end_rms_threshold)
+    _end_silence_hard_sec = float(end_silence_hard_sec if end_silence_hard_sec is not None else _end_silence_limit_sec)
+    _max_record_seconds = float(max_record_seconds if max_record_seconds is not None else 3.5)
     _chunk_sec_pre = float(chunk_sec_pre if chunk_sec_pre is not None else env_float("MIA_CHUNK_SEC_PRE", env_float("MIA_CHUNK_SEC", 0.40)))
     _chunk_sec_post = float(chunk_sec_post if chunk_sec_post is not None else env_float("MIA_CHUNK_SEC_POST", 0.45))
     _max_leadin_sec = float(max_leadin_sec if max_leadin_sec is not None else 3.0)
@@ -681,8 +691,12 @@ def record_vad_to_wav(
     frames: List[bytes] = []
     triggered = False
     silence_counter = 0
+    soft_silence_sec = 0.0
+    hard_silence_sec = 0.0
+    stop_reason: Optional[str] = None
 
     t0 = time.time()
+    trigger_start_ts: Optional[float] = None
     lead_in_start = time.time()
 
     # Temporäre Chunk-Dateien
@@ -693,8 +707,9 @@ def record_vad_to_wav(
         log(
             f"VAD tune: chunk_pre={_chunk_sec_pre:.2f}s chunk_post={_chunk_sec_post:.2f}s "
             f"start_ring_ms={_start_ring_ms} start_trigger_ratio={_start_trigger_ratio:.2f} "
-            f"start_rms={_start_rms_threshold} end_rms={_end_rms_threshold} "
-            f"end_silence={_end_silence_limit_sec:.2f}s max_leadin={_max_leadin_sec:.2f}s",
+            f"start_rms={_start_rms_threshold} end_soft=<{_end_rms_soft}/{_end_silence_soft_sec:.2f}s "
+            f"end_hard=<{_end_rms_hard}/{_end_silence_hard_sec:.2f}s max_record={_max_record_seconds:.2f}s "
+            f"max_leadin={_max_leadin_sec:.2f}s",
             debug,
         )
 
@@ -750,20 +765,37 @@ def record_vad_to_wav(
                     frames.extend([c for c, _ in ring_buffer])  # pre-roll übernehmen
                     ring_buffer.clear()
                     silence_counter = 0
+                    soft_silence_sec = 0.0
+                    hard_silence_sec = 0.0
+                    trigger_start_ts = time.time()
                     if debug:
                         log("VAD: speech start", debug)
             else:
-                # nach Trigger -> sammeln und Silence zählen
+                # nach Trigger -> sammeln und Ende-Bedingungen prüfen
                 frames.append(chunk)
                 if not is_speech:
                     silence_counter += 1
                 else:
                     silence_counter = 0
 
-                # genug Stille -> Ende
-                if (silence_counter * frame_ms / 1000.0) > _end_silence_limit_sec:
-                    if debug:
-                        log("VAD: speech end (silence)", debug)
+                frame_sec = frame_ms / 1000.0
+                if rms < _end_rms_soft:
+                    soft_silence_sec += frame_sec
+                else:
+                    soft_silence_sec = 0.0
+
+                if rms < _end_rms_hard:
+                    hard_silence_sec += frame_sec
+                else:
+                    hard_silence_sec = 0.0
+
+                if soft_silence_sec >= _end_silence_soft_sec:
+                    stop_reason = "soft_end"
+                    idx = len(pcm)
+                    break
+
+                if hard_silence_sec >= _end_silence_hard_sec:
+                    stop_reason = "hard_end"
                     idx = len(pcm)
                     break
 
@@ -771,8 +803,17 @@ def record_vad_to_wav(
         if not triggered:
             continue
 
-        # Wenn getriggert und Silence überschritten -> raus
-        if triggered and (silence_counter * frame_ms / 1000.0) > _end_silence_limit_sec:
+        # Wenn getriggert und Ende-Bedingung erreicht -> raus
+        if triggered and stop_reason is not None:
+            if debug:
+                log(f"VAD stop reason={stop_reason}", debug)
+            break
+
+        # globales Max-Record-Cap nach Trigger: lieber schnell transkribieren
+        if triggered and trigger_start_ts is not None and (time.time() - trigger_start_ts) > _max_record_seconds:
+            stop_reason = "max_record"
+            if debug:
+                log(f"VAD stop reason={stop_reason}", debug)
             break
 
     if not frames:
@@ -1603,6 +1644,11 @@ def main():
     vad_start_rms_threshold = env_int("MIA_VAD_START_RMS_THRESHOLD", 350)
     vad_end_silence_limit_sec = env_float("MIA_VAD_END_SILENCE_LIMIT_SEC", silence_limit)
     vad_end_rms_threshold = env_int("MIA_VAD_END_RMS_THRESHOLD", rms_threshold)
+    vad_end_rms_soft = env_int("MIA_VAD_END_RMS_SOFT", 480)
+    vad_end_silence_soft_sec = env_float("MIA_VAD_END_SILENCE_SOFT_SEC", 0.45)
+    vad_end_rms_hard = env_int("MIA_VAD_END_RMS_HARD", vad_end_rms_threshold)
+    vad_end_silence_hard_sec = env_float("MIA_VAD_END_SILENCE_HARD_SEC", vad_end_silence_limit_sec)
+    max_record_seconds = env_float("MAX_RECORD_SECONDS", 3.5)
     chunk_sec_pre = env_float("MIA_CHUNK_SEC_PRE", 0.22)
     chunk_sec_post = env_float("MIA_CHUNK_SEC_POST", 0.45)
     max_leadin_sec = env_float("MIA_MAX_LEADIN_SEC", 3.0)
@@ -1681,8 +1727,9 @@ def main():
     log(
         f"VAD fast-start/safe-end: chunk_pre={chunk_sec_pre:.2f}s chunk_post={chunk_sec_post:.2f}s "
         f"start_ring={vad_start_ring_ms} start_ratio={vad_start_trigger_ratio:.2f} "
-        f"start_rms={vad_start_rms_threshold} end_rms={vad_end_rms_threshold} "
-        f"end_silence={vad_end_silence_limit_sec:.2f}s max_leadin={max_leadin_sec:.2f}s",
+        f"start_rms={vad_start_rms_threshold} end_soft=<{vad_end_rms_soft}/{vad_end_silence_soft_sec:.2f}s "
+        f"end_hard=<{vad_end_rms_hard}/{vad_end_silence_hard_sec:.2f}s max_record={max_record_seconds:.2f}s "
+        f"max_leadin={max_leadin_sec:.2f}s",
         debug,
     )
 
@@ -1798,6 +1845,11 @@ def main():
             start_rms_threshold=vad_start_rms_threshold,
             end_silence_limit_sec=vad_end_silence_limit_sec,
             end_rms_threshold=vad_end_rms_threshold,
+            end_rms_soft=vad_end_rms_soft,
+            end_silence_soft_sec=vad_end_silence_soft_sec,
+            end_rms_hard=vad_end_rms_hard,
+            end_silence_hard_sec=vad_end_silence_hard_sec,
+            max_record_seconds=max_record_seconds,
             chunk_sec_pre=chunk_sec_pre,
             chunk_sec_post=chunk_sec_post,
             max_leadin_sec=max_leadin_sec,

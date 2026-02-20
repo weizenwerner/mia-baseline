@@ -1108,6 +1108,7 @@ class TTSManager:
         self.q: "queue.Queue[Union[Tuple[str, Optional[str]], None]]" = queue.Queue(maxsize=64)
         self.th: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._last_queue_warn_ts = 0.0
 
     def start(self) -> None:
         """Startet Worker-Thread (falls nicht läuft)."""
@@ -1117,6 +1118,11 @@ class TTSManager:
             self.th = threading.Thread(target=self._worker, daemon=True)
             self.th.start()
 
+    def reset_for_new_turn(self) -> None:
+        """Stellt TTS-Worker und Cancel-Status für einen neuen Turn sicher."""
+        CANCEL_TTS.clear()
+        self.start()
+
     def enqueue(self, text: str, turn_id: Optional[str] = None) -> None:
         """Legt Text in Queue (wenn nicht STOP/CANCEL)."""
         if STOP or CANCEL_TTS.is_set():
@@ -1125,8 +1131,12 @@ class TTSManager:
             self.q.put((text, turn_id), timeout=1.0)
             trace_note_enqueued(turn_id)
         except Exception:
-            # wenn Queue voll oder thread hängt: dann drop
-            pass
+            now = time.time()
+            if (now - self._last_queue_warn_ts) >= 0.33:
+                self._last_queue_warn_ts = now
+                log("TTS queue full -> dropping chunk", debug=True)
+            if turn_id:
+                trace_mark_chunk_done(turn_id)
 
     def stop(self, reason: str = "stop") -> None:
         """
@@ -1186,12 +1196,14 @@ class TTSManager:
                 try:
                     wav = piper_speak(txt, self.debug, turn_id=item_turn_id)
                     if STOP or CANCEL_TTS.is_set():
+                        if self.debug:
+                            log("TTS/Playback skipped: cancel/stop before playback", self.debug)
                         SPEAKING.clear()
                         continue
                     play_wav(wav, self.debug, turn_id=item_turn_id)
                 except Exception as e:
                     SPEAKING.clear()
-                    log(f"TTS/Playback ERROR: {e}", self.debug)
+                    log(f"TTS/Playback ERROR: {type(e).__name__}: {e}", self.debug)
                 finally:
                     if wav is not None:
                         try:
@@ -1842,13 +1854,12 @@ def main():
             log(f"Du: {user_text}", debug)
             sess["messages"].append({"role": "user", "content": user_text})
 
-            # neue Ausgabe -> cancel flag reset
-            CANCEL_TTS.clear()
-
+            # neue Ausgabe -> TTS für neuen Turn resetten
             if tts_stream:
-                # TTS Worker sicherstellen
-                tts_mgr.start()
+                tts_mgr.reset_for_new_turn()
                 log(">>> Mia spricht…", debug)
+            else:
+                CANCEL_TTS.clear()
 
             assistant = ""
             try:
@@ -1859,6 +1870,7 @@ def main():
                 if tts_stream:
                     real_chunk_emitted = {"v": False}
                     first_chunk_logged = {"v": False}
+                    chunks_enqueued = {"n": 0}
 
                     # Wenn ein Chunk fertig ist -> in TTS Queue
                     def emit_chunk(txt: str):
@@ -1869,6 +1881,7 @@ def main():
                             first_chunk_logged["v"] = True
                             log(f"First real chunk emitted at t={time.perf_counter() - t0_ollama:.2f}s", debug)
                         tts_mgr.enqueue(txt, turn_id=turn_id)
+                        chunks_enqueued["n"] += 1
                         recent_assistant.append(txt)
 
                     chunker = StreamChunker(
@@ -1896,6 +1909,11 @@ def main():
                     )
                     # Rest raus
                     chunker.flush()
+                    if chunks_enqueued["n"] == 0 and (assistant or "").strip():
+                        log("STREAM_TTS WARN: no chunks enqueued; enqueue full assistant as fallback", debug)
+                        tts_mgr.enqueue(assistant, turn_id=turn_id)
+                        chunks_enqueued["n"] += 1
+                        real_chunk_emitted["v"] = True
                 else:
                     # ohne streaming: erst komplette Antwort holen, dann ggf. sprechen (hier: nur log)
                     assistant = ollama_chat_http_stream(

@@ -314,6 +314,16 @@ def env_bool(name: str, default: bool = False) -> bool:
     return v in ("1", "true", "yes", "y", "on")
 
 
+def _csv_set(env_name: str, default: str) -> set[str]:
+    """CSV aus Env lesen, normalisieren und als Set zurückgeben."""
+    raw = env_str(env_name, default)
+    return {normalize_cmd(x) for x in raw.split(",") if normalize_cmd(x)}
+
+
+def _csv_list(env_name: str, default: str) -> list[str]:
+    """CSV aus Env lesen, normalisieren und als Liste (geordnet) zurückgeben."""
+    raw = env_str(env_name, default)
+    return [normalize_cmd(x) for x in raw.split(",") if normalize_cmd(x)]
 
 
 def load_local_env_file(path: Path, debug: bool = False) -> None:
@@ -1372,39 +1382,36 @@ def looks_like_echo(user_t: str, recent_assistant: Deque[str], min_overlap: floa
     return best >= min_overlap
 
 
-def is_phantom_utterance(text: str, state: str) -> bool:
-    """
-    Filtert typische Whisper-Halluzinationen/Hintergrund-Transkripte.
-    state kann später z.B. "confirm" sein; dort wird nicht gefiltert.
-    """
-    if state == "confirm":
-        return False
-    t = norm_text(text)
+def is_phantom_utterance(
+    text: str,
+    state: str,
+    phantom_exact: set[str],
+    phantom_contains: list[str],
+    phantom_max_words: int,
+    phantom_max_chars: int,
+    phantom_year_filter: bool,
+    confirm_allowed: set[str],
+) -> bool:
+    """Konfigurierbarer Phantom/Parasit-Filter für Transkripte."""
+    t = normalize_cmd(text)
     if not t:
         return True
 
-    # Nie als Phantom behandeln, wenn es wie ein explizites Kommando aussieht.
-    command_like = {"stop", "stopp", "pause", "mia stop", "mia stopp", "mia pause", "mia ende", "mir ende"}
-    if t in command_like:
+    if state == "AWAIT_CONFIRMATION":
+        if t in confirm_allowed:
+            return False
         return False
 
-    phantom_phrases = (
-        "zdf",
-        "untertitel",
-        "untertitelung",
-        "vielen dank",
-        "danke fürs zuschauen",
-        "danke fuers zuschauen",
-        "bis zum naechsten mal",
-        "bis zum nächsten mal",
-    )
-    if any(p in t for p in phantom_phrases):
+    if t in phantom_exact:
         return True
 
-    short_generic = {"ja", "okay", "ok", "danke", "bitte", "hm", "hmm"}
-    toks = t.split()
-    if len(toks) <= 2 and t in short_generic:
-        return True
+    word_count = len(t.split())
+    is_short = (word_count <= max(1, int(phantom_max_words))) or (len(t) <= max(1, int(phantom_max_chars)))
+    if is_short:
+        if any(p and (p in t) for p in phantom_contains):
+            return True
+        if phantom_year_filter and re.search(r"\b(19\d{2}|20\d{2})\b", t):
+            return True
 
     return False
 
@@ -1556,6 +1563,13 @@ def main():
     DEBUG_ENABLED = debug
     trace_env_raw = os.environ.get("MIA_TRACE_TIMINGS", "")
     TRACE_TIMINGS = env_bool("MIA_TRACE_TIMINGS", False)
+
+    phantom_exact = _csv_set("MIA_PHANTOM_EXACT", "danke,vielen dank,dankeschön,ok,okay,ja")
+    phantom_contains = _csv_list("MIA_PHANTOM_CONTAINS", "zdf,ard,untertitel,untertitelung")
+    phantom_max_words = env_int("MIA_PHANTOM_MAX_WORDS", 6)
+    phantom_max_chars = env_int("MIA_PHANTOM_MAX_CHARS", 40)
+    phantom_year_filter = env_bool("MIA_PHANTOM_YEAR_FILTER", True)
+    confirm_allowed = _csv_set("MIA_CONFIRM_ALLOWED", "ja,nein,ok,okay,stimmt,genau,weiter")
 
     log(f"TraceTimings: enabled={TRACE_TIMINGS} env={trace_env_raw if trace_env_raw != '' else '<unset>'}", debug)
     log(f"Using python: {sys.executable}", debug)
@@ -1819,11 +1833,6 @@ def main():
             if is_noise_transcript(t):
                 continue
 
-            if is_phantom_utterance(t, state="normal"):
-                if debug:
-                    log(f"Phantom utterance ignored: '{t}'", debug)
-                continue
-
             # STOP funktioniert hier im Nicht-SPEAKING-Modus weiterhin.
             # Voice-Exit wird ebenfalls nur hier (nicht während SPEAKING) geprüft.
             if is_stop_command(t, STOP_COMMANDS):
@@ -1887,6 +1896,20 @@ def main():
                     if debug:
                         log(f"Continue ignored without cancelled context: '{user_text}'", debug)
                     continue
+
+            if is_phantom_utterance(
+                user_text,
+                state,
+                phantom_exact,
+                phantom_contains,
+                phantom_max_words,
+                phantom_max_chars,
+                phantom_year_filter,
+                confirm_allowed,
+            ):
+                if debug:
+                    log(f"Phantom-filter -> ignored: '{user_text}'", debug)
+                continue
 
             # Echo-Guard nur kurz nach Playback-Ende:
             # Wenn user_text stark mit recent_assistant überlappt, ist es vermutlich Mia's Echo.

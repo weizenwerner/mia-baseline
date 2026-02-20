@@ -1360,6 +1360,43 @@ def looks_like_echo(user_t: str, recent_assistant: Deque[str], min_overlap: floa
     return best >= min_overlap
 
 
+def is_phantom_utterance(text: str, state: str) -> bool:
+    """
+    Filtert typische Whisper-Halluzinationen/Hintergrund-Transkripte.
+    state kann später z.B. "confirm" sein; dort wird nicht gefiltert.
+    """
+    if state == "confirm":
+        return False
+    t = norm_text(text)
+    if not t:
+        return True
+
+    # Nie als Phantom behandeln, wenn es wie ein explizites Kommando aussieht.
+    command_like = {"stop", "stopp", "pause", "mia stop", "mia stopp", "mia pause", "mia ende", "mir ende"}
+    if t in command_like:
+        return False
+
+    phantom_phrases = (
+        "zdf",
+        "untertitel",
+        "untertitelung",
+        "vielen dank",
+        "danke fürs zuschauen",
+        "danke fuers zuschauen",
+        "bis zum naechsten mal",
+        "bis zum nächsten mal",
+    )
+    if any(p in t for p in phantom_phrases):
+        return True
+
+    short_generic = {"ja", "okay", "ok", "danke", "bitte", "hm", "hmm"}
+    toks = t.split()
+    if len(toks) <= 2 and t in short_generic:
+        return True
+
+    return False
+
+
 def is_question_like(text: str) -> bool:
     """
     Wenn User-Text wie eine Frage aussieht, wollen wir ihn eher nicht als Echo wegwerfen.
@@ -1748,6 +1785,11 @@ def main():
 
             # Noise/Leere Transkripte ignorieren
             if is_noise_transcript(t):
+                continue
+
+            if is_phantom_utterance(t, state="normal"):
+                if debug:
+                    log(f"Phantom utterance ignored: '{t}'", debug)
                 continue
 
             # STOP funktioniert hier im Nicht-SPEAKING-Modus weiterhin.

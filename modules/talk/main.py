@@ -73,6 +73,32 @@ CURRENT_PLAY_PID: Optional[int] = None
 # Wird für Echo-Guard verwendet: kurz nach Playback-Ende sind Echo-Fehltriggers wahrscheinlicher.
 LAST_PLAY_END_TS: float = 0.0
 
+AUDIO_ACTIVITY_GRACE_SEC = 0.4
+STOP_ACTION_DEBOUNCE_SEC = 1.0
+STOP_ACTION_LOCK = threading.Lock()
+LAST_STOP_ACTION_TS: float = 0.0
+
+
+def is_audio_output_active() -> bool:
+    """Robuste Audio-Aktivitätsprüfung mit Failsafe + Grace."""
+    if AUDIO_OUT_ACTIVE.is_set() or SPEAKING.is_set() or (CURRENT_PLAY_PID is not None):
+        return True
+    return (time.time() - LAST_PLAY_END_TS) < AUDIO_ACTIVITY_GRACE_SEC
+
+
+def request_stop_output(tts_mgr: "TTSManager", reason: str, debug: bool) -> bool:
+    """Debounced Stop, damit Stop-Routinen nicht mehrfach parallel laufen."""
+    global LAST_STOP_ACTION_TS
+    now = time.time()
+    with STOP_ACTION_LOCK:
+        if (now - LAST_STOP_ACTION_TS) < STOP_ACTION_DEBOUNCE_SEC:
+            if debug:
+                log(f"Stop debounced: reason={reason}", debug)
+            return False
+        LAST_STOP_ACTION_TS = now
+    tts_mgr.stop(reason=reason)
+    return True
+
 STOP_COMMANDS: set = set()
 DEBUG_ENABLED = False
 
@@ -1137,7 +1163,6 @@ class TTSManager:
     def _worker(self) -> None:
         """Worker-Schleife: nimmt Texte aus Queue und spricht sie."""
         global AUDIO_OUT_LAST_ACTIVE_TS
-        grace_sec = 0.4
         try:
             while not STOP:
                 item = self.q.get()
@@ -1178,7 +1203,7 @@ class TTSManager:
 
                 # Nur clearen wenn wirklich idle + kurze Grace-Phase gegen Flackern.
                 while (not STOP) and (not CANCEL_TTS.is_set()) and self.q.empty() and (CURRENT_PLAY_PID is None) and (not SPEAKING.is_set()):
-                    if (time.time() - AUDIO_OUT_LAST_ACTIVE_TS) > grace_sec:
+                    if (time.time() - AUDIO_OUT_LAST_ACTIVE_TS) > AUDIO_ACTIVITY_GRACE_SEC:
                         AUDIO_OUT_ACTIVE.clear()
                         break
                     time.sleep(0.05)
@@ -1380,6 +1405,7 @@ class BargeInMonitor:
         self._stop = threading.Event()
         self._th_scan: Optional[threading.Thread] = None
         self._last_hit_ts = 0.0
+        self._last_err_log_ts = 0.0
 
     def start(self) -> None:
         self._th_scan = threading.Thread(target=self._scan_loop, daemon=True)
@@ -1403,7 +1429,7 @@ class BargeInMonitor:
         ensure_dir(tmp_dir)
 
         while not STOP and not self._stop.is_set():
-            if not AUDIO_OUT_ACTIVE.is_set():
+            if not is_audio_output_active():
                 time.sleep(self.interval_sec)
                 continue
 
@@ -1435,8 +1461,15 @@ class BargeInMonitor:
                         if self.debug:
                             log(f"BARGE HIT text='{txt}' norm='{nt}'", self.debug)
                         self.on_hit(txt)
-            except Exception:
-                pass
+            except Exception as e:
+                now = time.time()
+                if (now - self._last_err_log_ts) >= 5.0:
+                    self._last_err_log_ts = now
+                    log(
+                        f"BARGE ERROR (rate-limited): {e} "
+                        f"(model={Path(self.barge_model).name} window={self.window_sec:.2f}s interval={self.interval_sec:.2f}s)",
+                        self.debug,
+                    )
             finally:
                 try:
                     wav.unlink(missing_ok=True)
@@ -1616,8 +1649,7 @@ def main():
     tts_mgr = TTSManager(debug=debug)
 
     def _on_barge_hit(_txt: str) -> None:
-        CANCEL_TTS.set()
-        tts_mgr.stop(reason="barge")
+        request_stop_output(tts_mgr, reason="barge", debug=debug)
 
     barge_mon = BargeInMonitor(
         rate=rate,
@@ -1646,12 +1678,12 @@ def main():
                 log("Awake timeout: Mia schläft wieder (Wakeword nötig).", debug)
 
         # AUDIO_OUT_ACTIVE = stabiler Audio-Ausgabe-Modus
-        speaking_now = AUDIO_OUT_ACTIVE.is_set()
+        speaking_now = is_audio_output_active()
         if speaking_now:
             if debug and not speaking_wait_logged:
                 speaking_wait_logged = True
                 log(">>> Mia spricht: Main-Loop wartet passiv (Barge-in only).", debug)
-            while not STOP and AUDIO_OUT_ACTIVE.is_set():
+            while not STOP and is_audio_output_active():
                 time.sleep(0.05)
             continue
 
@@ -1724,7 +1756,7 @@ def main():
                 if debug:
                     log(f"Barge-in: stop erkannt -> '{t}'", debug)
                     log("Barge-in: cancel requested (stop)", debug)
-                tts_mgr.stop(reason="stop")
+                request_stop_output(tts_mgr, reason="stop", debug=debug)
                 log("Assistant output cancelled -> continue listening.", debug)
                 continue
 
@@ -1838,7 +1870,7 @@ def main():
             # Wenn user stopp gesagt hat während Streaming -> abbrechen
             if CANCEL_TTS.is_set():
                 trace_cancel_turn(turn_id)
-                tts_mgr.stop(reason="cancel")
+                request_stop_output(tts_mgr, reason="cancel", debug=debug)
                 log("Assistant output cancelled -> continue listening.", debug)
                 continue
 
